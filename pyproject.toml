@@ -12,6 +12,7 @@ dependencies = [
     "stockfish==4.0.8",
     "pandas>=2.2.0",
     "numpy>=1.26.0",
+    "pyarrow>=23.0.0",
 ]
 
 [project.optional-dependencies]
