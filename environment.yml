@@ -1,0 +1,15 @@
+name: chessvision
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12.6
+  - pip
+  - pip:
+    - chess==1.11.2
+    - stockfish==4.0.8
+    - pandas>=2.2.0
+    - numpy>=1.26.0
+    - pytest>=8.0.0
+    - black>=24.0.0
+    - ruff>=0.4.0
