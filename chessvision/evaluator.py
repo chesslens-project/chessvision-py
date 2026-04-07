@@ -121,11 +121,7 @@ def _run_stockfish_batched(
                 for fen in batch:
                     try:
                         board = chess.Board(fen)
-                        info  = engine.analyse(
-                            board,
-                            chess.engine.Limit(depth=depth),
-                            multipv=1,
-                        )
+                        info = engine.analyse(board, chess.engine.Limit(depth=depth))
                         score = info["score"].white().score(mate_score=10000)
                         batch_results[fen] = score
                     except Exception:
@@ -173,7 +169,7 @@ def _compute_cpl(df: pd.DataFrame) -> pd.DataFrame:
     white_mask = df["color"] == "white"
     black_mask = df["color"] == "black"
 
-    df["cpl"] = np.nan
+    df["cpl"] = pd.Series(dtype="float64")
 
     df.loc[white_mask, "cpl"] = (
         df.loc[white_mask, "eval_before"] -
