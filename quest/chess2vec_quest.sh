@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=YOUR_NETID
+#SBATCH --account=p32731
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -7,31 +7,25 @@
 #SBATCH --time=24:00:00
 #SBATCH --mem=64GB
 #SBATCH --job-name=chess2vec
-#SBATCH --output=/projects/YOUR_NETID/chessvision/logs/chess2vec_%j.log
+#SBATCH --output=/projects/p32731/chessvision/logs/chess2vec_%j.log
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=YOUR_EMAIL@northwestern.edu
+#SBATCH --mail-user=vbw3216@u.northwestern.edu
 
 echo "Job started: $(date)"
 echo "Node: $(hostname)"
 echo "CPUs: $SLURM_CPUS_PER_TASK"
 
-# Paths — edit these to match your Quest allocation
-PROJECT=/projects/YOUR_NETID/chessvision
+module load python/3.12.10
+
+PROJECT=/projects/p32731/chessvision
 TOKENS=$PROJECT/tokens
 MODEL=$PROJECT/models
 LOGS=$PROJECT/logs
 
 mkdir -p $TOKENS $MODEL $LOGS
 
-# Load Python
-module load python/3.12.6
+pip install chess gensim zstandard tqdm requests --quiet --user
 
-# Install dependencies if needed
-pip install chess gensim zstandard tqdm requests --quiet
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 1: Download and stream 3 months of Lichess data
-# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== STEP 1: Streaming Lichess data ==="
 python3 $PROJECT/lichess_stream.py \
@@ -41,9 +35,6 @@ python3 $PROJECT/lichess_stream.py \
 echo "Token files:"
 ls -lh $TOKENS/*.txt.gz
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Train chess2vec
-# ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== STEP 2: Training chess2vec ==="
 python3 $PROJECT/train_chess2vec.py \
