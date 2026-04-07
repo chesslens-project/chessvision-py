@@ -9,3 +9,7 @@ build/
 .env
 *.parquet
 data_*.csv
+data/tokens/
+data/chess2vec_model/
+*.model
+*.wordvectors
