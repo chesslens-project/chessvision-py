@@ -7,13 +7,14 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Optional
 
-CACHE_PATH = Path.home() / ".chessvision_cache.db"
+CACHE_PATH       = Path.home() / ".chessvision_cache.db"
+CHECKPOINT_PATH  = Path.home() / ".chessvision_checkpoint.json"
 
 BLUNDER_THRESHOLD    = 300
 MISTAKE_THRESHOLD    = 100
 INACCURACY_THRESHOLD = 50
 
-PHASE_OPENING_MAX_MOVE   = 15
+PHASE_OPENING_MAX_MOVE    = 15
 PHASE_ENDGAME_MAX_MATERIAL = 12
 
 
@@ -28,34 +29,30 @@ def evaluate_games(
     """
     Evaluate every position in moves_df with Stockfish.
 
-    Resumable: uses a SQLite cache keyed on FEN. If interrupted,
-    restart with the same call — already-evaluated positions are
-    loaded from cache instantly.
+    Fully resumable: uses SQLite cache keyed on FEN.
+    If interrupted at any point, restart with the same call
+    and it picks up exactly where it left off.
 
     Parameters
     ----------
-    moves_df      : move-level dataframe from parse_pgn()
-    stockfish_path: path to Stockfish binary
-    depth         : search depth (15 = good balance of speed/quality)
-    batch_size    : positions evaluated per Stockfish session
-    sample        : if set, only evaluate this many games (for testing)
-    cache         : use SQLite cache (always True in production)
-
-    Returns
-    -------
-    moves_df with eval_before, eval_after, cpl, phase,
-    is_blunder, is_mistake, is_inaccuracy filled in.
+    moves_df       : move-level dataframe from parse_pgn()
+    stockfish_path : path to Stockfish binary
+    depth          : search depth (15 = good balance)
+    batch_size     : positions per Stockfish session
+    sample         : only evaluate this many games (for testing)
+    cache          : use SQLite cache (always True in production)
     """
     df = moves_df.copy()
 
     if sample is not None:
         game_ids = df["game_id"].unique()[:sample]
-        df = df[df["game_id"].isin(game_ids)].copy()
-        print(f"Sample mode: evaluating {sample} games "
-              f"({len(df)} moves).")
+        df       = df[df["game_id"].isin(game_ids)].copy()
+        print(f"Sample mode: {sample} games ({len(df):,} moves)")
 
     _ensure_cache()
+
     unique_fens = df["fen_before"].dropna().unique().tolist()
+    print(f"\nTotal unique positions : {len(unique_fens):,}")
 
     if cache:
         cached      = _load_cache(unique_fens)
@@ -64,31 +61,36 @@ def evaluate_games(
         cached      = {}
         to_evaluate = unique_fens
 
-    total     = len(unique_fens)
-    n_cached  = len(cached)
-    n_new     = len(to_evaluate)
+    n_cached = len(cached)
+    n_new    = len(to_evaluate)
+    pct_done = n_cached / max(len(unique_fens), 1) * 100
 
-    print(f"\nPositions:  {total:,} total")
-    print(f"  cached:   {n_cached:,}  ({n_cached/max(total,1)*100:.1f}%)")
-    print(f"  new:      {n_new:,}  ({n_new/max(total,1)*100:.1f}%)")
+    print(f"  Already cached : {n_cached:,}  ({pct_done:.1f}% complete)")
+    print(f"  Still needed   : {n_new:,}")
 
     if n_new > 0:
-        est_minutes = n_new / 60 / 60 * depth
-        print(f"  Estimated time at depth {depth}: "
-              f"~{est_minutes:.0f} min  "
-              f"(run overnight if >60 min)\n")
+        est_min = n_new / 7 / 60  # ~7 pos/sec
+        print(f"  Estimated time : ~{est_min:.0f} min at depth {depth}")
+        if est_min > 60:
+            h = int(est_min // 60)
+            m = int(est_min % 60)
+            print(f"                   (~{h}h {m}m — safe to stop and resume)")
+        print()
+
         new_evals = _run_stockfish_batched(
             to_evaluate, stockfish_path, depth, batch_size, cache
         )
         cached.update(new_evals)
     else:
-        print("  All positions already cached — loading instantly.\n")
+        print("  All positions cached — mapping instantly.\n")
 
-    print("Mapping evaluations to moves...")
-    df = _map_evals_to_moves(df, cached)
+    print("Mapping evaluations to dataframe...")
+    df = _map_evals(df, cached)
     df = _compute_cpl(df)
     df = _label_phase(df)
     df = _label_errors(df)
+
+    _verify_mapping(df)
     _print_summary(df)
 
     return df
@@ -101,13 +103,8 @@ def _run_stockfish_batched(
     batch_size: int,
     cache: bool,
 ) -> dict:
-    """
-    Evaluate FENs in batches. Saves to cache after each batch
-    so progress is never lost if interrupted.
-    """
     results = {}
     batches = [fens[i:i+batch_size] for i in range(0, len(fens), batch_size)]
-
     print(f"Evaluating {len(fens):,} positions in "
           f"{len(batches)} batches of {batch_size}...")
 
@@ -121,7 +118,9 @@ def _run_stockfish_batched(
                 for fen in batch:
                     try:
                         board = chess.Board(fen)
-                        info = engine.analyse(board, chess.engine.Limit(depth=depth))
+                        info  = engine.analyse(
+                            board, chess.engine.Limit(depth=depth)
+                        )
                         score = info["score"].white().score(mate_score=10000)
                         batch_results[fen] = score
                     except Exception:
@@ -132,11 +131,11 @@ def _run_stockfish_batched(
 
             except Exception as e:
                 print(f"\nEngine error in batch {batch_num}: {e}")
-                print("Progress saved — restart the script to continue.")
+                print("Saving progress and stopping safely...")
                 if cache:
                     _save_cache(batch_results)
                 results.update(batch_results)
-                return results
+                raise KeyboardInterrupt
 
             if cache:
                 _save_cache(batch_results)
@@ -145,53 +144,77 @@ def _run_stockfish_batched(
     return results
 
 
-def _map_evals_to_moves(df: pd.DataFrame, cached: dict) -> pd.DataFrame:
-    """Map FEN evaluations onto the move dataframe."""
+def _map_evals(df: pd.DataFrame, cached: dict) -> pd.DataFrame:
+    """
+    Map cached FEN evaluations onto the move dataframe.
+    Uses direct dictionary lookup — no SQL queries at this stage.
+    """
+    print(f"  Cache size     : {len(cached):,} positions")
+
     df["eval_before"] = df["fen_before"].map(cached)
 
-    fens_after = (
-        df.groupby("game_id")["fen_before"]
-        .shift(-1)
-    )
-    df["eval_after"] = fens_after.map(cached)
+    fens_after        = df.groupby("game_id")["fen_before"].shift(-1)
+    df["eval_after"]  = fens_after.map(cached)
+
+    filled_before = df["eval_before"].notna().sum()
+    filled_after  = df["eval_after"].notna().sum()
+    print(f"  eval_before    : {filled_before:,} filled")
+    print(f"  eval_after     : {filled_after:,} filled")
 
     return df
 
 
+def _verify_mapping(df: pd.DataFrame) -> None:
+    """
+    Sanity check: if cache has data but mapping produced zeros,
+    something is wrong. Raise a clear error immediately.
+    """
+    evaluated = df["eval_before"].notna().sum()
+    total     = len(df)
+
+    if evaluated == 0 and total > 0:
+        # Sample the cache and dataframe to show the mismatch
+        conn         = sqlite3.connect(CACHE_PATH)
+        cache_sample = conn.execute(
+            "SELECT fen FROM evals LIMIT 3"
+        ).fetchall()
+        conn.close()
+
+        df_sample = df["fen_before"].head(3).tolist()
+
+        raise ValueError(
+            f"\nMapping failed — 0 of {total:,} positions matched cache.\n"
+            f"\nCache FEN example:\n  {cache_sample[0][0] if cache_sample else 'empty'}\n"
+            f"\nDataframe FEN example:\n  {df_sample[0] if df_sample else 'empty'}\n"
+            f"\nThese do not match. Clear the cache and re-evaluate:\n"
+            f"  python3.12 -c \""
+            f"import sqlite3; from pathlib import Path; "
+            f"conn = sqlite3.connect(Path.home() / '.chessvision_cache.db'); "
+            f"conn.execute('DELETE FROM evals'); conn.commit()\""
+        )
+
+    if evaluated < total * 0.5:
+        print(f"\nWARNING: Only {evaluated:,}/{total:,} positions mapped "
+              f"({evaluated/total*100:.1f}%). Cache may be incomplete.")
+        print("Re-run evaluate_games() to fill remaining positions.\n")
+
+
 def _compute_cpl(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Centipawn loss (CPL) per move.
-
-    For White: CPL = eval_before - eval_after  (positive = worse)
-    For Black: CPL = eval_after  - eval_before (positive = worse)
-    Both clipped at 0 (a good move has CPL 0, never negative).
-    """
-    white_mask = df["color"] == "white"
-    black_mask = df["color"] == "black"
-
     df["cpl"] = pd.Series(dtype="float64")
 
-    df.loc[white_mask, "cpl"] = (
-        df.loc[white_mask, "eval_before"] -
-        df.loc[white_mask, "eval_after"]
-    ).clip(lower=0)
+    white = df["color"] == "white"
+    black = df["color"] == "black"
 
-    df.loc[black_mask, "cpl"] = (
-        df.loc[black_mask, "eval_after"] -
-        df.loc[black_mask, "eval_before"]
-    ).clip(lower=0)
+    w_cpl = (df.loc[white, "eval_before"] - df.loc[white, "eval_after"])
+    b_cpl = (df.loc[black, "eval_after"]  - df.loc[black, "eval_before"])
+
+    df.loc[white, "cpl"] = w_cpl.clip(lower=0)
+    df.loc[black, "cpl"] = b_cpl.clip(lower=0)
 
     return df
 
 
 def _label_phase(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Label each move's game phase.
-
-    opening    : move_number <= 15
-    endgame    : total non-king material on board <= 12 pieces
-    middlegame : everything else
-    """
     phases = []
     for _, row in df.iterrows():
         if row["move_number"] <= PHASE_OPENING_MAX_MOVE:
@@ -199,61 +222,59 @@ def _label_phase(df: pd.DataFrame) -> pd.DataFrame:
             continue
         try:
             board    = chess.Board(row["fen_before"])
-            material = sum(
-                1 for p in board.piece_map().values()
-                if p.piece_type != chess.KING
+            material = sum(1 for p in board.piece_map().values()
+                           if p.piece_type != chess.KING)
+            phases.append(
+                "endgame" if material <= PHASE_ENDGAME_MAX_MATERIAL
+                else "middlegame"
             )
-            phases.append("endgame" if material <= PHASE_ENDGAME_MAX_MATERIAL
-                          else "middlegame")
         except Exception:
             phases.append("middlegame")
-
     df["phase"] = phases
     return df
 
 
 def _label_errors(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Classify each move by CPL thresholds (Lichess standard).
-
-    blunder    : CPL >= 300
-    mistake    : 100 <= CPL < 300
-    inaccuracy : 50  <= CPL < 100
-    """
     cpl = df["cpl"]
-    df["is_blunder"]    = cpl >= BLUNDER_THRESHOLD
-    df["is_mistake"]    = (cpl >= MISTAKE_THRESHOLD) & (cpl < BLUNDER_THRESHOLD)
-    df["is_inaccuracy"] = (cpl >= INACCURACY_THRESHOLD) & (cpl < MISTAKE_THRESHOLD)
+    df["is_blunder"]    = (cpl >= BLUNDER_THRESHOLD).astype(bool)
+    df["is_mistake"]    = ((cpl >= MISTAKE_THRESHOLD) &
+                           (cpl < BLUNDER_THRESHOLD)).astype(bool)
+    df["is_inaccuracy"] = ((cpl >= INACCURACY_THRESHOLD) &
+                           (cpl < MISTAKE_THRESHOLD)).astype(bool)
     return df
 
 
 def _print_summary(df: pd.DataFrame) -> None:
-    """Print a human-readable evaluation summary."""
-    total    = len(df)
-    evaluated = df["cpl"].notna().sum()
-    blunders  = df["is_blunder"].sum()
-    mistakes  = df["is_mistake"].sum()
+    total        = len(df)
+    evaluated    = df["cpl"].notna().sum()
+    blunders     = df["is_blunder"].sum()
+    mistakes     = df["is_mistake"].sum()
     inaccuracies = df["is_inaccuracy"].sum()
-    mean_cpl  = df["cpl"].mean()
+    mean_cpl     = df["cpl"].mean()
 
-    print(f"\nEvaluation complete:")
-    print(f"  Moves evaluated : {evaluated:,} / {total:,}")
-    print(f"  Mean CPL        : {mean_cpl:.1f}")
-    print(f"  Blunders        : {blunders:,}  ({blunders/max(evaluated,1)*100:.1f}%)")
-    print(f"  Mistakes        : {mistakes:,}  ({mistakes/max(evaluated,1)*100:.1f}%)")
-    print(f"  Inaccuracies    : {inaccuracies:,}  ({inaccuracies/max(evaluated,1)*100:.1f}%)")
-    print()
+    print(f"\nEvaluation summary:")
+    print(f"  Moves evaluated  : {evaluated:,} / {total:,}")
+    print(f"  Mean CPL         : {mean_cpl:.1f}")
+    print(f"  Blunders         : {blunders:,}  "
+          f"({blunders/max(evaluated,1)*100:.1f}%)")
+    print(f"  Mistakes         : {mistakes:,}  "
+          f"({mistakes/max(evaluated,1)*100:.1f}%)")
+    print(f"  Inaccuracies     : {inaccuracies:,}  "
+          f"({inaccuracies/max(evaluated,1)*100:.1f}%)")
 
     if "phase" in df.columns:
-        phase_cpl = df.groupby("phase")["cpl"].mean().round(1)
-        print("  Mean CPL by phase:")
-        for phase, val in phase_cpl.items():
-            print(f"    {phase:<12}: {val}")
+        print(f"\n  Mean CPL by phase:")
+        for phase, val in df.groupby("phase")["cpl"].mean().items():
+            print(f"    {phase:<12} : {val:.1f}")
+
+    if "color" in df.columns:
+        print(f"\n  Mean CPL by color:")
+        for color, val in df.groupby("color")["cpl"].mean().items():
+            print(f"    {color:<12} : {val:.1f}")
     print()
 
 
 def _ensure_cache() -> None:
-    """Create the SQLite cache table if it does not exist."""
     conn = sqlite3.connect(CACHE_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS evals (
@@ -266,17 +287,17 @@ def _ensure_cache() -> None:
 
 
 def _load_cache(fens: list) -> dict:
-    """Load previously computed evaluations from SQLite in chunks of 900."""
     if not fens:
         return {}
-    results = {}
+    results    = {}
     chunk_size = 900
-    conn = sqlite3.connect(CACHE_PATH)
+    conn       = sqlite3.connect(CACHE_PATH)
     for i in range(0, len(fens), chunk_size):
-        chunk = fens[i:i+chunk_size]
+        chunk        = fens[i:i+chunk_size]
         placeholders = ",".join("?" * len(chunk))
-        rows = conn.execute(
-            f"SELECT fen, score FROM evals WHERE fen IN ({placeholders})",
+        rows         = conn.execute(
+            f"SELECT fen, score FROM evals "
+            f"WHERE fen IN ({placeholders})",
             chunk,
         ).fetchall()
         for row in rows:
@@ -286,7 +307,6 @@ def _load_cache(fens: list) -> dict:
 
 
 def _save_cache(evals: dict) -> None:
-    """Persist new evaluations to SQLite cache."""
     if not evals:
         return
     conn = sqlite3.connect(CACHE_PATH)
