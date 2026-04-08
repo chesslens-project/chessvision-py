@@ -13,3 +13,16 @@ data/tokens/
 data/chess2vec_model/
 *.model
 *.wordvectors
+# Model outputs
+archetypes/
+chess2vec_model/
+model_test/
+tokens/
+tokens_test/
+nohup.out
+eval_log.txt
+stream_log.txt
+archetypes_log.txt
+data_moves_evaluated.parquet
+data_moves_featured.parquet
+data_games.parquet
