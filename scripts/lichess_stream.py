@@ -1,19 +1,22 @@
 """
 lichess_stream.py
 
-Streaming pipeline for chess2vec training data.
-Downloads Lichess monthly PGN files one at a time,
-extracts move token sequences, writes compact output,
-deletes the source file, moves to next month.
+Tokenization pipeline for chess2vec training data.
+Reads local .pgn.zst files and extracts move token sequences.
 
-Runs entirely locally on your machine.
-Token files are small (~2MB per month) even though
-source files are large (5-30GB per month).
+Download files manually from https://database.lichess.org/
+then run this script to tokenize them.
 
 Usage:
-    python3 scripts/lichess_stream.py --months 3 --output data/tokens/
-    python3 scripts/lichess_stream.py --start 2024-01 --end 2024-12 --output data/tokens/
-    python3 scripts/lichess_stream.py --all --output data/tokens/
+    # Tokenize all .pgn.zst files in a folder
+    python3 scripts/lichess_stream.py \
+        --input  /path/to/lichess_dataset/ \
+        --output /path/to/tokens/
+
+    # Tokenize a single file
+    python3 scripts/lichess_stream.py \
+        --input  /path/to/lichess_db_standard_rated_2026-03.pgn.zst \
+        --output /path/to/tokens/
 """
 
 import argparse
@@ -23,7 +26,6 @@ import gzip
 import io
 import json
 import re
-import requests
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -41,13 +43,11 @@ except ImportError:
     print("Install tqdm: pip3 install tqdm")
     sys.exit(1)
 
-BASE_URL   = "https://database.lichess.org/standard/lichess_db_standard_rated_{year}-{month:02d}.pgn.zst"
-CHUNK_SIZE = 1024 * 1024 * 4  # 4MB
 
 MIN_ELO        = 800
 MAX_ELO        = 3500
 MIN_MOVES      = 5
-CLOCK_REQUIRED = False  # False = include pre-2017 games without clocks
+CLOCK_REQUIRED = False
 
 OPENING_MAX_MOVE   = 15
 ENDGAME_MAX_PIECES = 12
@@ -63,55 +63,102 @@ EVAL_BUCKETS = [
 ]
 
 
-def get_available_months() -> list:
-    print("Fetching available months from database.lichess.org...")
-    resp = requests.get("https://database.lichess.org/", timeout=30)
-    resp.raise_for_status()
-    pattern = r'lichess_db_standard_rated_(\d{4})-(\d{2})\.pgn\.zst'
-    matches = re.findall(pattern, resp.text)
-    months  = sorted(set((int(y), int(m)) for y, m in matches), reverse=True)
-    print(f"Found {len(months)} available months")
-    return months
+# ─────────────────────────────────────────────────────────────────────────────
+# File discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_pgn_zst_files(input_path: Path) -> list:
+    """Find all .pgn.zst files in a path (file or directory)."""
+    if input_path.is_file():
+        if input_path.suffix == ".zst":
+            return [input_path]
+        else:
+            raise ValueError(f"Not a .pgn.zst file: {input_path}")
+    elif input_path.is_dir():
+        files = sorted(input_path.glob("*.pgn.zst"))
+        if not files:
+            raise FileNotFoundError(
+                f"No .pgn.zst files found in {input_path}\n"
+                f"Download from https://database.lichess.org/"
+            )
+        return files
+    else:
+        raise FileNotFoundError(f"Path does not exist: {input_path}")
 
 
-def stream_pgn_games(year: int, month: int) -> Iterator[chess.pgn.Game]:
-    url  = BASE_URL.format(year=year, month=month)
-    print(f"\nStreaming {year}-{month:02d} from {url}")
-    resp = requests.get(url, stream=True, timeout=60)
-    resp.raise_for_status()
+def extract_year_month(filepath: Path) -> tuple:
+    """Extract year and month from Lichess filename."""
+    match = re.search(r"(\d{4})-(\d{2})\.pgn\.zst", filepath.name)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return 0, 0
 
-    total_bytes = int(resp.headers.get("Content-Length", 0))
-    dctx        = zstd.ZstdDecompressor(max_window_size=2**31)
-    pgn_buffer  = io.TextIOWrapper(
-        dctx.stream_reader(resp.raw, read_size=CHUNK_SIZE),
-        encoding="utf-8",
-        errors="replace",
-    )
 
-    games_seen = games_accepted = 0
-    bar = tqdm(total=total_bytes, unit="B", unit_scale=True,
-               desc=f"  {year}-{month:02d}", leave=False)
+# ─────────────────────────────────────────────────────────────────────────────
+# Local file streaming
+# ─────────────────────────────────────────────────────────────────────────────
 
-    while True:
-        try:
-            game = chess.pgn.read_game(pgn_buffer)
-            if game is None:
-                break
-            games_seen += 1
-            if games_seen % 10_000 == 0:
-                bar.update(0)
-            if _accept_game(game):
-                games_accepted += 1
-                yield game
-        except Exception:
-            continue
+def stream_local_file(filepath: Path) -> Iterator[chess.pgn.Game]:
+    """
+    Stream games from a local .pgn.zst file.
+    No network required — reads directly from disk.
+    """
+    file_size   = filepath.stat().st_size
+    games_seen  = 0
+    games_accepted = 0
 
-    bar.close()
-    print(f"  Streamed {games_seen:,} games, accepted {games_accepted:,} "
+    print(f"  Reading {filepath.name} ({file_size/1024/1024/1024:.2f} GB)")
+
+    with open(filepath, "rb") as raw_file:
+        dctx       = zstd.ZstdDecompressor(max_window_size=2**31)
+        pgn_buffer = io.TextIOWrapper(
+            dctx.stream_reader(raw_file, read_size=1024*1024*4),
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        bar = tqdm(
+            total=file_size,
+            unit="B",
+            unit_scale=True,
+            desc=f"  Processing",
+            leave=True,
+        )
+
+        while True:
+            try:
+                game = chess.pgn.read_game(pgn_buffer)
+                if game is None:
+                    break
+                games_seen += 1
+
+                if games_seen % 10_000 == 0:
+                    try:
+                        pos = raw_file.tell()
+                        bar.update(pos - bar.n)
+                    except Exception:
+                        pass
+
+                if _accept_game(game):
+                    games_accepted += 1
+                    yield game
+
+            except Exception:
+                continue
+
+        bar.close()
+
+    print(f"  Done: {games_seen:,} streamed, "
+          f"{games_accepted:,} accepted "
           f"({games_accepted/max(games_seen,1)*100:.1f}%)")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtering
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _accept_game(game: chess.pgn.Game) -> bool:
+    """Filter to standard, rated, non-bot games in ELO range."""
     h = game.headers
     if h.get("Variant", "Standard") != "Standard":
         return False
@@ -133,11 +180,17 @@ def _accept_game(game: chess.pgn.Game) -> bool:
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tokenization
+# ─────────────────────────────────────────────────────────────────────────────
+
 def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
+    """Convert a game into enriched move tokens."""
     tokens = []
     board  = game.board()
     node   = game
     move_number = 0
+
     while node.variations:
         next_node   = node.variations[0]
         move        = next_node.move
@@ -153,6 +206,7 @@ def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
             node = next_node
         except Exception:
             break
+
     return tokens if len(tokens) >= MIN_MOVES else None
 
 
@@ -170,8 +224,9 @@ def _parse_eval(comment: str, is_white: bool) -> str:
     mate = re.search(r'\[%eval #(-?\d+)\]', comment)
     if mate:
         n = int(mate.group(1))
-        return ("winning_easily" if (is_white and n > 0) or
-                (not is_white and n < 0) else "losing_badly")
+        return ("winning_easily"
+                if (is_white and n > 0) or (not is_white and n < 0)
+                else "losing_badly")
     cp = re.search(r'\[%eval (-?\d+\.?\d*)\]', comment)
     if cp:
         val = float(cp.group(1)) * 100
@@ -190,30 +245,57 @@ def _parse_clock_bucket(comment: str) -> str:
     if not m:
         return "noclock"
     secs = int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3))
-    if secs > 300:   return "plenty"
-    if secs > 60:    return "moderate"
-    if secs > 15:    return "low"
+    if secs > 300:  return "plenty"
+    if secs > 60:   return "moderate"
+    if secs > 15:   return "low"
     return "critical"
 
 
-def process_month(year: int, month: int, output_dir: Path,
-                  max_games: Optional[int] = None) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# Output writer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_file(
+    filepath: Path,
+    output_dir: Path,
+    max_games: Optional[int] = None,
+) -> dict:
+    """
+    Tokenize one local .pgn.zst file.
+    Skips if output already exists (resume support).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path  = output_dir / f"tokens_{year}_{month:02d}.txt.gz"
-    meta_path = output_dir / f"tokens_{year}_{month:02d}.meta.json"
+    year, month = extract_year_month(filepath)
+
+    if year and month:
+        out_name  = f"tokens_{year}_{month:02d}.txt.gz"
+        meta_name = f"tokens_{year}_{month:02d}.meta.json"
+    else:
+        stem      = filepath.stem.replace(".pgn", "")
+        out_name  = f"tokens_{stem}.txt.gz"
+        meta_name = f"tokens_{stem}.meta.json"
+
+    out_path  = output_dir / out_name
+    meta_path = output_dir / meta_name
 
     if out_path.exists() and meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
-        print(f"  Already done {year}-{month:02d}: "
-              f"{meta['games_written']:,} games. Skipping.")
+        print(f"  Already done: {out_path.name} "
+              f"({meta['games_written']:,} games). Skipping.")
         return meta
 
-    stats = {"year": year, "month": month, "games_written": 0,
-             "tokens_written": 0, "started": datetime.now().isoformat()}
+    stats = {
+        "source_file":    filepath.name,
+        "year":           year,
+        "month":          month,
+        "games_written":  0,
+        "tokens_written": 0,
+        "started":        datetime.now().isoformat(),
+    }
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
-        for i, game in enumerate(stream_pgn_games(year, month)):
+        for i, game in enumerate(stream_local_file(filepath)):
             if max_games and i >= max_games:
                 break
             tokens = tokenize_game(game)
@@ -222,60 +304,66 @@ def process_month(year: int, month: int, output_dir: Path,
             out_f.write(" ".join(tokens) + "\n")
             stats["games_written"]  += 1
             stats["tokens_written"] += len(tokens)
-            if stats["games_written"] % 100_000 == 0:
-                print(f"    {stats['games_written']:,} games written...")
+            if stats["games_written"] % 500_000 == 0:
+                print(f"    {stats['games_written']:,} games tokenized...")
 
     stats["finished"] = datetime.now().isoformat()
     with open(meta_path, "w") as f:
         json.dump(stats, f, indent=2)
 
     size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"  Done: {stats['games_written']:,} games, "
+    print(f"  Saved: {stats['games_written']:,} games, "
           f"{stats['tokens_written']:,} tokens, "
-          f"{size_mb:.1f} MB")
+          f"{size_mb:.1f} MB → {out_path.name}")
     return stats
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output",    required=True)
-    parser.add_argument("--months",    type=int, default=3)
-    parser.add_argument("--start",     help="YYYY-MM")
-    parser.add_argument("--end",       help="YYYY-MM")
-    parser.add_argument("--all",       action="store_true")
-    parser.add_argument("--max-games", type=int)
+    parser = argparse.ArgumentParser(
+        description="Tokenize local Lichess .pgn.zst files for chess2vec"
+    )
+    parser.add_argument(
+        "--input", required=True,
+        help="Path to a .pgn.zst file or folder containing multiple files"
+    )
+    parser.add_argument(
+        "--output", required=True,
+        help="Output directory for token .txt.gz files"
+    )
+    parser.add_argument(
+        "--max-games", type=int,
+        help="Max games per file (for testing)"
+    )
     args = parser.parse_args()
 
+    input_path = Path(args.input)
     output_dir = Path(args.output)
-    available  = get_available_months()
+    files      = find_pgn_zst_files(input_path)
 
-    if args.all:
-        months = available
-    elif args.start and args.end:
-        sy, sm = map(int, args.start.split("-"))
-        ey, em = map(int, args.end.split("-"))
-        months = [(y, m) for y, m in available
-                  if (sy, sm) <= (y, m) <= (ey, em)]
-    else:
-        months = available[:args.months]
+    print(f"Found {len(files)} file(s) to process:")
+    for f in files:
+        size_gb = f.stat().st_size / 1024**3
+        print(f"  {f.name} ({size_gb:.1f} GB)")
+    print()
 
-    print(f"\nWill process {len(months)} month(s)")
-    total = {"games": 0, "tokens": 0, "done": 0}
+    total = {"games": 0, "tokens": 0, "files": 0}
 
-    for year, month in months:
-        try:
-            s = process_month(year, month, output_dir, args.max_games)
-            total["games"]  += s["games_written"]
-            total["tokens"] += s["tokens_written"]
-            total["done"]   += 1
-        except KeyboardInterrupt:
-            print("\nInterrupted. Re-run to resume from where you left off.")
-            break
-        except Exception as e:
-            print(f"Error on {year}-{month:02d}: {e}. Skipping.")
+    for filepath in files:
+        print(f"\nProcessing: {filepath.name}")
+        stats = process_file(filepath, output_dir, args.max_games)
+        total["games"]  += stats["games_written"]
+        total["tokens"] += stats["tokens_written"]
+        total["files"]  += 1
 
-    print(f"\nDone. {total['done']} months, "
-          f"{total['games']:,} games, {total['tokens']:,} tokens")
+    print(f"\nAll done.")
+    print(f"  Files processed : {total['files']}")
+    print(f"  Total games     : {total['games']:,}")
+    print(f"  Total tokens    : {total['tokens']:,}")
+    print(f"  Token files in  : {output_dir}")
 
 
 if __name__ == "__main__":
