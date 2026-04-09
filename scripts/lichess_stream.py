@@ -112,7 +112,7 @@ def stream_local_file(filepath: Path) -> Iterator[chess.pgn.Game]:
     with open(filepath, "rb") as raw_file:
         dctx       = zstd.ZstdDecompressor(max_window_size=2**31)
         pgn_buffer = io.TextIOWrapper(
-            dctx.stream_reader(raw_file, read_size=1024*1024*4),
+            dctx.stream_reader(raw_file, read_size=1024*1024*64),
             encoding="utf-8",
             errors="replace",
         )
