@@ -2,13 +2,12 @@
 lichess_stream.py
 
 Fast multiprocessing tokenizer for local Lichess .pgn.zst files.
-Uses all available CPU cores to parse games in parallel.
 
 Usage:
     python3 scripts/lichess_stream.py \
         --input  /path/to/lichess_dataset/ \
         --output /path/to/tokens/ \
-        --workers 10
+        --workers 8
 """
 
 import argparse
@@ -36,7 +35,7 @@ MAX_ELO            = 3500
 MIN_MOVES          = 5
 OPENING_MAX_MOVE   = 15
 ENDGAME_MAX_PIECES = 12
-CHUNK_SIZE         = 1024 * 1024 * 32
+CHUNK_SIZE         = 1024 * 1024 * 16  # 16MB chunks
 
 EVAL_BUCKETS = [
     (-10000, -300, "losing_badly"),
@@ -57,7 +56,7 @@ def find_pgn_zst_files(input_path: Path) -> list:
     elif input_path.is_dir():
         files = sorted(input_path.glob("*.pgn.zst"))
         if not files:
-            raise FileNotFoundError(f"No .pgn.zst files found in {input_path}")
+            raise FileNotFoundError(f"No .pgn.zst files in {input_path}")
         return files
     raise FileNotFoundError(f"Path does not exist: {input_path}")
 
@@ -69,7 +68,7 @@ def extract_year_month(filepath: Path) -> tuple:
     return 0, 0
 
 
-def _accept_game(game: chess.pgn.Game) -> bool:
+def _accept_game(game) -> bool:
     h = game.headers
     if h.get("Variant", "Standard") != "Standard":
         return False
@@ -87,7 +86,7 @@ def _accept_game(game: chess.pgn.Game) -> bool:
     return True
 
 
-def _get_phase(board: chess.Board, move_number: int) -> str:
+def _get_phase(board, move_number: int) -> str:
     if move_number <= OPENING_MAX_MOVE:
         return "opening"
     pieces = sum(1 for p in board.piece_map().values()
@@ -128,7 +127,7 @@ def _parse_clock_bucket(comment: str) -> str:
     return "critical"
 
 
-def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
+def tokenize_game(game) -> Optional[list]:
     tokens      = []
     board       = game.board()
     node        = game
@@ -151,8 +150,8 @@ def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
     return tokens if len(tokens) >= MIN_MOVES else None
 
 
-def _process_chunk(args):
-    chunk_text, chunk_id = args
+def process_chunk(chunk_text: str) -> list:
+    """Worker: parse PGN chunk, return list of token strings."""
     lines      = []
     game_texts = re.split(r'\n\n(?=\[Event )', chunk_text)
     for game_text in game_texts:
@@ -167,13 +166,33 @@ def _process_chunk(args):
                 lines.append(" ".join(tokens))
         except Exception:
             continue
-    return chunk_id, lines
+    return lines
+
+
+def generate_chunks(filepath: Path):
+    """Generator: yield text chunks from a .pgn.zst file."""
+    text_buffer = ""
+    with open(filepath, "rb") as raw_file:
+        dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+        with dctx.stream_reader(raw_file, read_size=CHUNK_SIZE) as reader:
+            while True:
+                raw = reader.read(CHUNK_SIZE)
+                if not raw:
+                    break
+                text_buffer += raw.decode("utf-8", errors="replace")
+                boundary     = text_buffer.rfind("\n\n[Event ")
+                if boundary == -1:
+                    continue
+                yield text_buffer[:boundary]
+                text_buffer = text_buffer[boundary:]
+            if text_buffer.strip():
+                yield text_buffer
 
 
 def process_file(
     filepath: Path,
     output_dir: Path,
-    workers: int = 10,
+    workers: int = 8,
     max_games: Optional[int] = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -202,102 +221,36 @@ def process_file(
           f"({file_size/1024**3:.1f} GB) | {workers} workers")
 
     start_time     = time.time()
-    bytes_read     = 0
     games_written  = 0
     tokens_written = 0
-    chunk_id       = 0
-    text_buffer    = ""
-    pending        = []
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
-        pool = mp.Pool(processes=workers)
-        try:
-            with open(filepath, "rb") as raw_file:
-                dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-                with dctx.stream_reader(raw_file,
-                                        read_size=CHUNK_SIZE) as reader:
-                    while True:
-                        raw = reader.read(CHUNK_SIZE)
-                        if not raw:
-                            break
+        with mp.Pool(processes=workers) as pool:
+            chunk_gen = generate_chunks(filepath)
 
-                        bytes_read  += len(raw)
-                        text_buffer += raw.decode("utf-8", errors="replace")
-                        boundary     = text_buffer.rfind("\n\n[Event ")
-                        if boundary == -1:
-                            continue
+            for lines in pool.imap_unordered(
+                process_chunk,
+                chunk_gen,
+                chunksize=1,
+            ):
+                for line in lines:
+                    out_f.write(line + "\n")
+                    games_written  += 1
+                    tokens_written += len(line.split())
 
-                        complete    = text_buffer[:boundary]
-                        text_buffer = text_buffer[boundary:]
+                if games_written % 100_000 == 0 and games_written > 0:
+                    elapsed = time.time() - start_time
+                    print(f"  {games_written:,} games | "
+                          f"{elapsed/60:.1f} min elapsed",
+                          flush=True)
 
-                        if complete.strip():
-                            r = pool.apply_async(
-                                _process_chunk, [(complete, chunk_id)]
-                            )
-                            pending.append((chunk_id, r))
-                            chunk_id += 1
-
-                        # Collect any ready results immediately
-                        still_pending = []
-                        for cid, res in pending:
-                            if res.ready():
-                                try:
-                                    _, lines = res.get(timeout=5)
-                                    for line in lines:
-                                        out_f.write(line + "\n")
-                                        games_written  += 1
-                                        tokens_written += len(line.split())
-                                except Exception:
-                                    pass
-                            else:
-                                still_pending.append((cid, res))
-                        pending = still_pending
-
-                        elapsed = time.time() - start_time
-                        speed   = bytes_read / max(elapsed, 1) / 1024**2
-                        pct     = bytes_read / file_size * 100
-                        eta_h   = ((file_size - bytes_read)
-                                   / max(bytes_read / max(elapsed, 1), 1)
-                                   ) / 3600
-                        print(
-                            f"  {pct:5.1f}% | "
-                            f"{speed:5.1f} MB/s | "
-                            f"ETA {eta_h:.1f}h | "
-                            f"{games_written:,} games",
-                            end="\r", flush=True
-                        )
-
-                        if max_games and games_written >= max_games:
-                            raise StopIteration
-
-                # Drain remaining
-                if text_buffer.strip():
-                    r = pool.apply_async(
-                        _process_chunk, [(text_buffer, chunk_id)]
-                    )
-                    pending.append((chunk_id, r))
-
-                for cid, res in pending:
-                    try:
-                        _, lines = res.get(timeout=120)
-                        for line in lines:
-                            out_f.write(line + "\n")
-                            games_written  += 1
-                            tokens_written += len(line.split())
-                    except Exception:
-                        continue
-
-        except StopIteration:
-            pass
-        finally:
-            pool.close()
-            pool.join()
+                if max_games and games_written >= max_games:
+                    pool.terminate()
+                    break
 
     elapsed   = time.time() - start_time
-    avg_speed = file_size / max(elapsed, 1) / 1024**2
     print(f"\n  Done: {games_written:,} games | "
           f"{tokens_written:,} tokens | "
-          f"{avg_speed:.1f} MB/s avg | "
           f"{elapsed/3600:.1f} hrs")
 
     stats = {
@@ -309,7 +262,6 @@ def process_file(
         "started":        datetime.now().isoformat(),
         "finished":       datetime.now().isoformat(),
         "workers":        workers,
-        "avg_speed_mbs":  round(avg_speed, 1),
     }
     with open(meta_path, "w") as f:
         json.dump(stats, f, indent=2)
@@ -321,7 +273,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input",     required=True)
     parser.add_argument("--output",    required=True)
-    parser.add_argument("--workers",   type=int, default=10)
+    parser.add_argument("--workers",   type=int, default=8)
     parser.add_argument("--max-games", type=int)
     parser.add_argument("--append",    action="store_true")
     args = parser.parse_args()
