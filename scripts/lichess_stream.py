@@ -338,11 +338,19 @@ def main():
         "--max-games", type=int,
         help="Max games per file (for testing)"
     )
+    parser.add_argument(
+        "--append", action="store_true",
+        help="Add new files to existing token collection. Already tokenized files are skipped automatically."
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
     files      = find_pgn_zst_files(input_path)
+
+    existing = list(output_dir.glob("*.txt.gz")) if output_dir.exists() else []
+    if existing:
+        print(f"Existing token files: {len(existing)} (will be skipped)")
 
     print(f"Found {len(files)} file(s) to process:")
     for f in files:
