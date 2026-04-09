@@ -4,19 +4,11 @@ lichess_stream.py
 Fast multiprocessing tokenizer for local Lichess .pgn.zst files.
 Uses all available CPU cores to parse games in parallel.
 
-Download files from https://database.lichess.org/ then run:
-
+Usage:
     python3 scripts/lichess_stream.py \
         --input  /path/to/lichess_dataset/ \
         --output /path/to/tokens/ \
-        --workers 8
-
-Add new files later without reprocessing existing ones:
-
-    python3 scripts/lichess_stream.py \
-        --input  /path/to/new_file.pgn.zst \
-        --output /path/to/tokens/ \
-        --append
+        --workers 10
 """
 
 import argparse
@@ -44,7 +36,7 @@ MAX_ELO            = 3500
 MIN_MOVES          = 5
 OPENING_MAX_MOVE   = 15
 ENDGAME_MAX_PIECES = 12
-CHUNK_SIZE         = 1024 * 1024 * 32  # 32MB per worker chunk
+CHUNK_SIZE         = 1024 * 1024 * 32
 
 EVAL_BUCKETS = [
     (-10000, -300, "losing_badly"),
@@ -57,10 +49,6 @@ EVAL_BUCKETS = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File discovery
-# ─────────────────────────────────────────────────────────────────────────────
-
 def find_pgn_zst_files(input_path: Path) -> list:
     if input_path.is_file():
         if input_path.suffix == ".zst":
@@ -69,10 +57,7 @@ def find_pgn_zst_files(input_path: Path) -> list:
     elif input_path.is_dir():
         files = sorted(input_path.glob("*.pgn.zst"))
         if not files:
-            raise FileNotFoundError(
-                f"No .pgn.zst files found in {input_path}\n"
-                f"Download from https://database.lichess.org/"
-            )
+            raise FileNotFoundError(f"No .pgn.zst files found in {input_path}")
         return files
     raise FileNotFoundError(f"Path does not exist: {input_path}")
 
@@ -83,10 +68,6 @@ def extract_year_month(filepath: Path) -> tuple:
         return int(match.group(1)), int(match.group(2))
     return 0, 0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Filtering and tokenization
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _accept_game(game: chess.pgn.Game) -> bool:
     h = game.headers
@@ -170,16 +151,10 @@ def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
     return tokens if len(tokens) >= MIN_MOVES else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Multiprocessing worker
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _process_chunk(args):
-    """Worker: parse a chunk of PGN text, return tokenized lines."""
     chunk_text, chunk_id = args
     lines      = []
     game_texts = re.split(r'\n\n(?=\[Event )', chunk_text)
-
     for game_text in game_texts:
         if not game_text.strip() or "[Event " not in game_text:
             continue
@@ -192,24 +167,15 @@ def _process_chunk(args):
                 lines.append(" ".join(tokens))
         except Exception:
             continue
-
     return chunk_id, lines
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main file processor
-# ─────────────────────────────────────────────────────────────────────────────
 
 def process_file(
     filepath: Path,
     output_dir: Path,
-    workers: int = 8,
+    workers: int = 10,
     max_games: Optional[int] = None,
 ) -> dict:
-    """
-    Tokenize one local .pgn.zst file using multiprocessing.
-    Skips if output already exists (resume/append support).
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     year, month = extract_year_month(filepath)
 
@@ -240,17 +206,14 @@ def process_file(
     games_written  = 0
     tokens_written = 0
     chunk_id       = 0
-    next_to_write  = 0
-    pending        = []
     text_buffer    = ""
+    pending        = []
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
         pool = mp.Pool(processes=workers)
-
         try:
             with open(filepath, "rb") as raw_file:
                 dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-
                 with dctx.stream_reader(raw_file,
                                         read_size=CHUNK_SIZE) as reader:
                     while True:
@@ -260,12 +223,11 @@ def process_file(
 
                         bytes_read  += len(raw)
                         text_buffer += raw.decode("utf-8", errors="replace")
-
-                        boundary = text_buffer.rfind("\n\n[Event ")
+                        boundary     = text_buffer.rfind("\n\n[Event ")
                         if boundary == -1:
                             continue
 
-                        complete  = text_buffer[:boundary]
+                        complete    = text_buffer[:boundary]
                         text_buffer = text_buffer[boundary:]
 
                         if complete.strip():
@@ -275,43 +237,40 @@ def process_file(
                             pending.append((chunk_id, r))
                             chunk_id += 1
 
-                        # Write results in order
-                        while pending:
-                            cid, res = pending[0]
-                            if cid != next_to_write:
-                                break
-                            try:
-                                _, lines = res.get(timeout=120)
-                                for line in lines:
-                                    out_f.write(line + "\n")
-                                    games_written  += 1
-                                    tokens_written += len(line.split())
-                                next_to_write += 1
-                                pending.pop(0)
+                        # Collect any ready results immediately
+                        still_pending = []
+                        for cid, res in pending:
+                            if res.ready():
+                                try:
+                                    _, lines = res.get(timeout=5)
+                                    for line in lines:
+                                        out_f.write(line + "\n")
+                                        games_written  += 1
+                                        tokens_written += len(line.split())
+                                except Exception:
+                                    pass
+                            else:
+                                still_pending.append((cid, res))
+                        pending = still_pending
 
-                                elapsed = time.time() - start_time
-                                speed   = bytes_read / elapsed / 1024**2
-                                pct     = bytes_read / file_size * 100
-                                eta_h   = ((file_size - bytes_read)
-                                           / (bytes_read / elapsed)) / 3600
-                                print(
-                                    f"  {pct:5.1f}% | "
-                                    f"{speed:5.1f} MB/s | "
-                                    f"ETA {eta_h:.1f}h | "
-                                    f"{games_written:,} games",
-                                    end="\r", flush=True
-                                )
+                        elapsed = time.time() - start_time
+                        speed   = bytes_read / max(elapsed, 1) / 1024**2
+                        pct     = bytes_read / file_size * 100
+                        eta_h   = ((file_size - bytes_read)
+                                   / max(bytes_read / max(elapsed, 1), 1)
+                                   ) / 3600
+                        print(
+                            f"  {pct:5.1f}% | "
+                            f"{speed:5.1f} MB/s | "
+                            f"ETA {eta_h:.1f}h | "
+                            f"{games_written:,} games",
+                            end="\r", flush=True
+                        )
 
-                                if max_games and games_written >= max_games:
-                                    raise StopIteration
+                        if max_games and games_written >= max_games:
+                            raise StopIteration
 
-                            except StopIteration:
-                                raise
-                            except Exception:
-                                next_to_write += 1
-                                pending.pop(0)
-
-                # Process remaining buffer
+                # Drain remaining
                 if text_buffer.strip():
                     r = pool.apply_async(
                         _process_chunk, [(text_buffer, chunk_id)]
@@ -334,8 +293,8 @@ def process_file(
             pool.close()
             pool.join()
 
-    elapsed = time.time() - start_time
-    avg_speed = file_size / elapsed / 1024**2
+    elapsed   = time.time() - start_time
+    avg_speed = file_size / max(elapsed, 1) / 1024**2
     print(f"\n  Done: {games_written:,} games | "
           f"{tokens_written:,} tokens | "
           f"{avg_speed:.1f} MB/s avg | "
@@ -358,34 +317,13 @@ def process_file(
     return stats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fast multiprocessing tokenizer for Lichess .pgn.zst files"
-    )
-    parser.add_argument(
-        "--input", required=True,
-        help="Path to a .pgn.zst file or folder of files"
-    )
-    parser.add_argument(
-        "--output", required=True,
-        help="Output directory for token .txt.gz files"
-    )
-    parser.add_argument(
-        "--workers", type=int, default=8,
-        help="Number of parallel workers (default: 8)"
-    )
-    parser.add_argument(
-        "--max-games", type=int,
-        help="Max games per file (for testing)"
-    )
-    parser.add_argument(
-        "--append", action="store_true",
-        help="Add new files to existing token collection"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input",     required=True)
+    parser.add_argument("--output",    required=True)
+    parser.add_argument("--workers",   type=int, default=10)
+    parser.add_argument("--max-games", type=int)
+    parser.add_argument("--append",    action="store_true")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -403,7 +341,6 @@ def main():
     print()
 
     total = {"games": 0, "tokens": 0, "files": 0}
-
     for filepath in files:
         stats = process_file(
             filepath, output_dir,
