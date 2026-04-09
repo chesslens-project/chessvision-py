@@ -1,22 +1,22 @@
 """
 lichess_stream.py
 
-Tokenization pipeline for chess2vec training data.
-Reads local .pgn.zst files and extracts move token sequences.
+Fast multiprocessing tokenizer for local Lichess .pgn.zst files.
+Uses all available CPU cores to parse games in parallel.
 
-Download files manually from https://database.lichess.org/
-then run this script to tokenize them.
+Download files from https://database.lichess.org/ then run:
 
-Usage:
-    # Tokenize all .pgn.zst files in a folder
     python3 scripts/lichess_stream.py \
         --input  /path/to/lichess_dataset/ \
-        --output /path/to/tokens/
+        --output /path/to/tokens/ \
+        --workers 8
 
-    # Tokenize a single file
+Add new files later without reprocessing existing ones:
+
     python3 scripts/lichess_stream.py \
-        --input  /path/to/lichess_db_standard_rated_2026-03.pgn.zst \
-        --output /path/to/tokens/
+        --input  /path/to/new_file.pgn.zst \
+        --output /path/to/tokens/ \
+        --append
 """
 
 import argparse
@@ -25,11 +25,13 @@ import chess.pgn
 import gzip
 import io
 import json
+import multiprocessing as mp
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 try:
     import zstandard as zstd
@@ -37,20 +39,12 @@ except ImportError:
     print("Install zstandard: pip3 install zstandard")
     sys.exit(1)
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    print("Install tqdm: pip3 install tqdm")
-    sys.exit(1)
-
-
-MIN_ELO        = 800
-MAX_ELO        = 3500
-MIN_MOVES      = 5
-CLOCK_REQUIRED = False
-
+MIN_ELO            = 800
+MAX_ELO            = 3500
+MIN_MOVES          = 5
 OPENING_MAX_MOVE   = 15
 ENDGAME_MAX_PIECES = 12
+CHUNK_SIZE         = 1024 * 1024 * 32  # 32MB per worker chunk
 
 EVAL_BUCKETS = [
     (-10000, -300, "losing_badly"),
@@ -68,12 +62,10 @@ EVAL_BUCKETS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_pgn_zst_files(input_path: Path) -> list:
-    """Find all .pgn.zst files in a path (file or directory)."""
     if input_path.is_file():
         if input_path.suffix == ".zst":
             return [input_path]
-        else:
-            raise ValueError(f"Not a .pgn.zst file: {input_path}")
+        raise ValueError(f"Not a .pgn.zst file: {input_path}")
     elif input_path.is_dir():
         files = sorted(input_path.glob("*.pgn.zst"))
         if not files:
@@ -82,12 +74,10 @@ def find_pgn_zst_files(input_path: Path) -> list:
                 f"Download from https://database.lichess.org/"
             )
         return files
-    else:
-        raise FileNotFoundError(f"Path does not exist: {input_path}")
+    raise FileNotFoundError(f"Path does not exist: {input_path}")
 
 
 def extract_year_month(filepath: Path) -> tuple:
-    """Extract year and month from Lichess filename."""
     match = re.search(r"(\d{4})-(\d{2})\.pgn\.zst", filepath.name)
     if match:
         return int(match.group(1)), int(match.group(2))
@@ -95,70 +85,10 @@ def extract_year_month(filepath: Path) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Local file streaming
-# ─────────────────────────────────────────────────────────────────────────────
-
-def stream_local_file(filepath: Path) -> Iterator[chess.pgn.Game]:
-    """
-    Stream games from a local .pgn.zst file.
-    No network required — reads directly from disk.
-    """
-    file_size   = filepath.stat().st_size
-    games_seen  = 0
-    games_accepted = 0
-
-    print(f"  Reading {filepath.name} ({file_size/1024/1024/1024:.2f} GB)")
-
-    with open(filepath, "rb") as raw_file:
-        dctx       = zstd.ZstdDecompressor(max_window_size=2**31)
-        pgn_buffer = io.TextIOWrapper(
-            dctx.stream_reader(raw_file, read_size=1024*1024*64),
-            encoding="utf-8",
-            errors="replace",
-        )
-
-        bar = tqdm(
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            desc=f"  Processing",
-            leave=True,
-        )
-
-        while True:
-            try:
-                game = chess.pgn.read_game(pgn_buffer)
-                if game is None:
-                    break
-                games_seen += 1
-
-                if games_seen % 10_000 == 0:
-                    try:
-                        pos = raw_file.tell()
-                        bar.update(pos - bar.n)
-                    except Exception:
-                        pass
-
-                if _accept_game(game):
-                    games_accepted += 1
-                    yield game
-
-            except Exception:
-                continue
-
-        bar.close()
-
-    print(f"  Done: {games_seen:,} streamed, "
-          f"{games_accepted:,} accepted "
-          f"({games_accepted/max(games_seen,1)*100:.1f}%)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Filtering
+# Filtering and tokenization
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _accept_game(game: chess.pgn.Game) -> bool:
-    """Filter to standard, rated, non-bot games in ELO range."""
     h = game.headers
     if h.get("Variant", "Standard") != "Standard":
         return False
@@ -173,41 +103,7 @@ def _accept_game(game: chess.pgn.Game) -> bool:
             return False
     except ValueError:
         return False
-    if CLOCK_REQUIRED:
-        first = game.next().comment if game.next() else ""
-        if "%clk" not in first:
-            return False
     return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tokenization
-# ─────────────────────────────────────────────────────────────────────────────
-
-def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
-    """Convert a game into enriched move tokens."""
-    tokens = []
-    board  = game.board()
-    node   = game
-    move_number = 0
-
-    while node.variations:
-        next_node   = node.variations[0]
-        move        = next_node.move
-        move_number += 1
-        try:
-            color  = "white" if board.turn == chess.WHITE else "black"
-            san    = board.san(move)
-            phase  = _get_phase(board, move_number)
-            eval_b = _parse_eval(next_node.comment, board.turn == chess.WHITE)
-            clk_b  = _parse_clock_bucket(next_node.comment)
-            tokens.append(f"{san}_{phase}_{color}_{eval_b}_{clk_b}")
-            board.push(move)
-            node = next_node
-        except Exception:
-            break
-
-    return tokens if len(tokens) >= MIN_MOVES else None
 
 
 def _get_phase(board: chess.Board, move_number: int) -> str:
@@ -251,18 +147,68 @@ def _parse_clock_bucket(comment: str) -> str:
     return "critical"
 
 
+def tokenize_game(game: chess.pgn.Game) -> Optional[list]:
+    tokens      = []
+    board       = game.board()
+    node        = game
+    move_number = 0
+    while node.variations:
+        next_node   = node.variations[0]
+        move        = next_node.move
+        move_number += 1
+        try:
+            color  = "white" if board.turn == chess.WHITE else "black"
+            san    = board.san(move)
+            phase  = _get_phase(board, move_number)
+            eval_b = _parse_eval(next_node.comment, board.turn == chess.WHITE)
+            clk_b  = _parse_clock_bucket(next_node.comment)
+            tokens.append(f"{san}_{phase}_{color}_{eval_b}_{clk_b}")
+            board.push(move)
+            node = next_node
+        except Exception:
+            break
+    return tokens if len(tokens) >= MIN_MOVES else None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Output writer
+# Multiprocessing worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _process_chunk(args):
+    """Worker: parse a chunk of PGN text, return tokenized lines."""
+    chunk_text, chunk_id = args
+    lines      = []
+    game_texts = re.split(r'\n\n(?=\[Event )', chunk_text)
+
+    for game_text in game_texts:
+        if not game_text.strip() or "[Event " not in game_text:
+            continue
+        try:
+            game = chess.pgn.read_game(io.StringIO(game_text))
+            if game is None or not _accept_game(game):
+                continue
+            tokens = tokenize_game(game)
+            if tokens:
+                lines.append(" ".join(tokens))
+        except Exception:
+            continue
+
+    return chunk_id, lines
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main file processor
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_file(
     filepath: Path,
     output_dir: Path,
+    workers: int = 8,
     max_games: Optional[int] = None,
 ) -> dict:
     """
-    Tokenize one local .pgn.zst file.
-    Skips if output already exists (resume support).
+    Tokenize one local .pgn.zst file using multiprocessing.
+    Skips if output already exists (resume/append support).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     year, month = extract_year_month(filepath)
@@ -285,54 +231,152 @@ def process_file(
               f"({meta['games_written']:,} games). Skipping.")
         return meta
 
+    file_size = filepath.stat().st_size
+    print(f"Processing: {filepath.name} "
+          f"({file_size/1024**3:.1f} GB) | {workers} workers")
+
+    start_time     = time.time()
+    bytes_read     = 0
+    games_written  = 0
+    tokens_written = 0
+    chunk_id       = 0
+    next_to_write  = 0
+    pending        = []
+    text_buffer    = ""
+
+    with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
+        pool = mp.Pool(processes=workers)
+
+        try:
+            with open(filepath, "rb") as raw_file:
+                dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+
+                with dctx.stream_reader(raw_file,
+                                        read_size=CHUNK_SIZE) as reader:
+                    while True:
+                        raw = reader.read(CHUNK_SIZE)
+                        if not raw:
+                            break
+
+                        bytes_read  += len(raw)
+                        text_buffer += raw.decode("utf-8", errors="replace")
+
+                        boundary = text_buffer.rfind("\n\n[Event ")
+                        if boundary == -1:
+                            continue
+
+                        complete  = text_buffer[:boundary]
+                        text_buffer = text_buffer[boundary:]
+
+                        if complete.strip():
+                            r = pool.apply_async(
+                                _process_chunk, [(complete, chunk_id)]
+                            )
+                            pending.append((chunk_id, r))
+                            chunk_id += 1
+
+                        # Write results in order
+                        while pending:
+                            cid, res = pending[0]
+                            if cid != next_to_write:
+                                break
+                            try:
+                                _, lines = res.get(timeout=120)
+                                for line in lines:
+                                    out_f.write(line + "\n")
+                                    games_written  += 1
+                                    tokens_written += len(line.split())
+                                next_to_write += 1
+                                pending.pop(0)
+
+                                elapsed = time.time() - start_time
+                                speed   = bytes_read / elapsed / 1024**2
+                                pct     = bytes_read / file_size * 100
+                                eta_h   = ((file_size - bytes_read)
+                                           / (bytes_read / elapsed)) / 3600
+                                print(
+                                    f"  {pct:5.1f}% | "
+                                    f"{speed:5.1f} MB/s | "
+                                    f"ETA {eta_h:.1f}h | "
+                                    f"{games_written:,} games",
+                                    end="\r", flush=True
+                                )
+
+                                if max_games and games_written >= max_games:
+                                    raise StopIteration
+
+                            except StopIteration:
+                                raise
+                            except Exception:
+                                next_to_write += 1
+                                pending.pop(0)
+
+                # Process remaining buffer
+                if text_buffer.strip():
+                    r = pool.apply_async(
+                        _process_chunk, [(text_buffer, chunk_id)]
+                    )
+                    pending.append((chunk_id, r))
+
+                for cid, res in pending:
+                    try:
+                        _, lines = res.get(timeout=120)
+                        for line in lines:
+                            out_f.write(line + "\n")
+                            games_written  += 1
+                            tokens_written += len(line.split())
+                    except Exception:
+                        continue
+
+        except StopIteration:
+            pass
+        finally:
+            pool.close()
+            pool.join()
+
+    elapsed = time.time() - start_time
+    avg_speed = file_size / elapsed / 1024**2
+    print(f"\n  Done: {games_written:,} games | "
+          f"{tokens_written:,} tokens | "
+          f"{avg_speed:.1f} MB/s avg | "
+          f"{elapsed/3600:.1f} hrs")
+
     stats = {
         "source_file":    filepath.name,
         "year":           year,
         "month":          month,
-        "games_written":  0,
-        "tokens_written": 0,
+        "games_written":  games_written,
+        "tokens_written": tokens_written,
         "started":        datetime.now().isoformat(),
+        "finished":       datetime.now().isoformat(),
+        "workers":        workers,
+        "avg_speed_mbs":  round(avg_speed, 1),
     }
-
-    with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
-        for i, game in enumerate(stream_local_file(filepath)):
-            if max_games and i >= max_games:
-                break
-            tokens = tokenize_game(game)
-            if tokens is None:
-                continue
-            out_f.write(" ".join(tokens) + "\n")
-            stats["games_written"]  += 1
-            stats["tokens_written"] += len(tokens)
-            if stats["games_written"] % 500_000 == 0:
-                print(f"    {stats['games_written']:,} games tokenized...")
-
-    stats["finished"] = datetime.now().isoformat()
     with open(meta_path, "w") as f:
         json.dump(stats, f, indent=2)
 
-    size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"  Saved: {stats['games_written']:,} games, "
-          f"{stats['tokens_written']:,} tokens, "
-          f"{size_mb:.1f} MB → {out_path.name}")
     return stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tokenize local Lichess .pgn.zst files for chess2vec"
+        description="Fast multiprocessing tokenizer for Lichess .pgn.zst files"
     )
     parser.add_argument(
         "--input", required=True,
-        help="Path to a .pgn.zst file or folder containing multiple files"
+        help="Path to a .pgn.zst file or folder of files"
     )
     parser.add_argument(
         "--output", required=True,
         help="Output directory for token .txt.gz files"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Number of parallel workers (default: 8)"
     )
     parser.add_argument(
         "--max-games", type=int,
@@ -340,7 +384,7 @@ def main():
     )
     parser.add_argument(
         "--append", action="store_true",
-        help="Add new files to existing token collection. Already tokenized files are skipped automatically."
+        help="Add new files to existing token collection"
     )
     args = parser.parse_args()
 
@@ -354,15 +398,18 @@ def main():
 
     print(f"Found {len(files)} file(s) to process:")
     for f in files:
-        size_gb = f.stat().st_size / 1024**3
-        print(f"  {f.name} ({size_gb:.1f} GB)")
+        print(f"  {f.name} ({f.stat().st_size/1024**3:.1f} GB)")
+    print(f"Workers: {args.workers}")
     print()
 
     total = {"games": 0, "tokens": 0, "files": 0}
 
     for filepath in files:
-        print(f"\nProcessing: {filepath.name}")
-        stats = process_file(filepath, output_dir, args.max_games)
+        stats = process_file(
+            filepath, output_dir,
+            workers   = args.workers,
+            max_games = args.max_games,
+        )
         total["games"]  += stats["games_written"]
         total["tokens"] += stats["tokens_written"]
         total["files"]  += 1
