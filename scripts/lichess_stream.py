@@ -1,11 +1,12 @@
 """
 lichess_stream.py
 
-Fast multiprocessing tokenizer for local Lichess .pgn.zst files.
+Multiprocessing tokenizer for plain PGN files.
+Reads local .pgn files and produces token files for chess2vec training.
 
 Usage:
     python3 scripts/lichess_stream.py \
-        --input  /path/to/lichess_dataset/ \
+        --input  /path/to/pgn_folder/ \
         --output /path/to/tokens/ \
         --workers 8
 """
@@ -24,18 +25,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-try:
-    import zstandard as zstd
-except ImportError:
-    print("Install zstandard: pip3 install zstandard")
-    sys.exit(1)
-
 MIN_ELO            = 800
-MAX_ELO            = 3500
+MAX_ELO            = 4000
 MIN_MOVES          = 5
 OPENING_MAX_MOVE   = 15
 ENDGAME_MAX_PIECES = 12
-CHUNK_SIZE         = 1024 * 1024 * 16  # 16MB chunks
 
 EVAL_BUCKETS = [
     (-10000, -300, "losing_badly"),
@@ -48,25 +42,35 @@ EVAL_BUCKETS = [
 ]
 
 
-def find_pgn_zst_files(input_path: Path) -> list:
+# ─────────────────────────────────────────────────────────────────────────────
+# File discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_pgn_files(input_path: Path) -> list:
+    """Find all .pgn files in a path (file or directory)."""
     if input_path.is_file():
-        if input_path.suffix == ".zst":
+        if input_path.suffix.lower() == ".pgn":
             return [input_path]
-        raise ValueError(f"Not a .pgn.zst file: {input_path}")
+        raise ValueError(f"Not a .pgn file: {input_path}")
     elif input_path.is_dir():
-        files = sorted(input_path.glob("*.pgn.zst"))
+        files = sorted(input_path.glob("*.pgn"))
         if not files:
-            raise FileNotFoundError(f"No .pgn.zst files in {input_path}")
+            raise FileNotFoundError(f"No .pgn files found in {input_path}")
         return files
     raise FileNotFoundError(f"Path does not exist: {input_path}")
 
 
 def extract_year_month(filepath: Path) -> tuple:
-    match = re.search(r"(\d{4})-(\d{2})\.pgn\.zst", filepath.name)
+    """Extract year and month from filename if present."""
+    match = re.search(r"(\d{4})[-_](\d{2})", filepath.name)
     if match:
         return int(match.group(1)), int(match.group(2))
     return 0, 0
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtering
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _accept_game(game) -> bool:
     h = game.headers
@@ -79,12 +83,16 @@ def _accept_game(game) -> bool:
     try:
         w = int(h.get("WhiteElo", 0))
         b = int(h.get("BlackElo", 0))
-        if not (MIN_ELO <= w <= MAX_ELO and MIN_ELO <= b <= MAX_ELO):
+        if w < MIN_ELO or b < MIN_ELO:
             return False
-    except ValueError:
+    except (ValueError, TypeError):
         return False
     return True
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tokenization
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_phase(board, move_number: int) -> str:
     if move_number <= OPENING_MAX_MOVE:
@@ -150,8 +158,12 @@ def tokenize_game(game) -> Optional[list]:
     return tokens if len(tokens) >= MIN_MOVES else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Multiprocessing worker
+# ─────────────────────────────────────────────────────────────────────────────
+
 def process_chunk(chunk_text: str) -> list:
-    """Worker: parse PGN chunk, return list of token strings."""
+    """Worker: parse a PGN text chunk, return tokenized lines."""
     lines      = []
     game_texts = re.split(r'\n\n(?=\[Event )', chunk_text)
     for game_text in game_texts:
@@ -169,25 +181,28 @@ def process_chunk(chunk_text: str) -> list:
     return lines
 
 
-def generate_chunks(filepath: Path):
-    """Generator: yield text chunks from a .pgn.zst file."""
+def generate_chunks(filepath: Path, chunk_size_mb: int = 32):
+    """Generator: yield text chunks from a plain PGN file."""
+    chunk_size  = chunk_size_mb * 1024 * 1024
     text_buffer = ""
-    with open(filepath, "rb") as raw_file:
-        dctx = zstd.ZstdDecompressor(max_window_size=2**31)
-        with dctx.stream_reader(raw_file, read_size=CHUNK_SIZE) as reader:
-            while True:
-                raw = reader.read(CHUNK_SIZE)
-                if not raw:
-                    break
-                text_buffer += raw.decode("utf-8", errors="replace")
-                boundary     = text_buffer.rfind("\n\n[Event ")
-                if boundary == -1:
-                    continue
-                yield text_buffer[:boundary]
-                text_buffer = text_buffer[boundary:]
-            if text_buffer.strip():
-                yield text_buffer
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        while True:
+            raw = f.read(chunk_size)
+            if not raw:
+                break
+            text_buffer += raw
+            boundary     = text_buffer.rfind("\n\n[Event ")
+            if boundary == -1:
+                continue
+            yield text_buffer[:boundary]
+            text_buffer = text_buffer[boundary:]
+        if text_buffer.strip():
+            yield text_buffer
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File processor
+# ─────────────────────────────────────────────────────────────────────────────
 
 def process_file(
     filepath: Path,
@@ -195,16 +210,13 @@ def process_file(
     workers: int = 8,
     max_games: Optional[int] = None,
 ) -> dict:
+    """Tokenize one PGN file. Skips if already done (resume support)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     year, month = extract_year_month(filepath)
 
-    if year and month:
-        out_name  = f"tokens_{year}_{month:02d}.txt.gz"
-        meta_name = f"tokens_{year}_{month:02d}.meta.json"
-    else:
-        stem      = filepath.stem.replace(".pgn", "")
-        out_name  = f"tokens_{stem}.txt.gz"
-        meta_name = f"tokens_{stem}.meta.json"
+    stem      = filepath.stem
+    out_name  = f"tokens_{stem}.txt.gz"
+    meta_name = f"tokens_{stem}.meta.json"
 
     out_path  = output_dir / out_name
     meta_path = output_dir / meta_name
@@ -212,13 +224,13 @@ def process_file(
     if out_path.exists() and meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
-        print(f"  Already done: {out_path.name} "
+        print(f"  Already done: {stem} "
               f"({meta['games_written']:,} games). Skipping.")
         return meta
 
     file_size = filepath.stat().st_size
-    print(f"Processing: {filepath.name} "
-          f"({file_size/1024**3:.1f} GB) | {workers} workers")
+    print(f"\nProcessing: {filepath.name} "
+          f"({file_size/1024**2:.0f} MB) | {workers} workers")
 
     start_time     = time.time()
     games_written  = 0
@@ -226,11 +238,9 @@ def process_file(
 
     with gzip.open(out_path, "wt", encoding="utf-8") as out_f:
         with mp.Pool(processes=workers) as pool:
-            chunk_gen = generate_chunks(filepath)
-
             for lines in pool.imap_unordered(
                 process_chunk,
-                chunk_gen,
+                generate_chunks(filepath),
                 chunksize=1,
             ):
                 for line in lines:
@@ -238,20 +248,22 @@ def process_file(
                     games_written  += 1
                     tokens_written += len(line.split())
 
-                if games_written % 100_000 == 0 and games_written > 0:
+                if games_written % 50_000 == 0 and games_written > 0:
                     elapsed = time.time() - start_time
                     print(f"  {games_written:,} games | "
-                          f"{elapsed/60:.1f} min elapsed",
+                          f"{elapsed/60:.1f} min",
                           flush=True)
 
                 if max_games and games_written >= max_games:
                     pool.terminate()
                     break
 
-    elapsed   = time.time() - start_time
-    print(f"\n  Done: {games_written:,} games | "
+    elapsed = time.time() - start_time
+    size_mb = out_path.stat().st_size / 1024**2
+    print(f"  Done: {games_written:,} games | "
           f"{tokens_written:,} tokens | "
-          f"{elapsed/3600:.1f} hrs")
+          f"{size_mb:.1f} MB output | "
+          f"{elapsed/60:.1f} min")
 
     stats = {
         "source_file":    filepath.name,
@@ -269,30 +281,52 @@ def process_file(
     return stats
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input",     required=True)
-    parser.add_argument("--output",    required=True)
-    parser.add_argument("--workers",   type=int, default=8)
-    parser.add_argument("--max-games", type=int)
-    parser.add_argument("--append",    action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Tokenize PGN files for chess2vec training"
+    )
+    parser.add_argument(
+        "--input", required=True,
+        help="Path to a .pgn file or folder of .pgn files"
+    )
+    parser.add_argument(
+        "--output", required=True,
+        help="Output directory for token .txt.gz files"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Number of parallel workers (default: 8)"
+    )
+    parser.add_argument(
+        "--max-games", type=int,
+        help="Max games per file (for testing)"
+    )
+    parser.add_argument(
+        "--append", action="store_true",
+        help="Add new files to existing token collection"
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
-    files      = find_pgn_zst_files(input_path)
+    files      = find_pgn_files(input_path)
 
     existing = list(output_dir.glob("*.txt.gz")) if output_dir.exists() else []
     if existing:
         print(f"Existing token files: {len(existing)} (will be skipped)")
 
-    print(f"Found {len(files)} file(s) to process:")
-    for f in files:
-        print(f"  {f.name} ({f.stat().st_size/1024**3:.1f} GB)")
+    print(f"Found {len(files)} PGN file(s) to process:")
+    total_size = sum(f.stat().st_size for f in files)
+    print(f"Total size: {total_size/1024**3:.1f} GB")
     print(f"Workers: {args.workers}")
     print()
 
     total = {"games": 0, "tokens": 0, "files": 0}
+
     for filepath in files:
         stats = process_file(
             filepath, output_dir,
