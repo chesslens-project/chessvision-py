@@ -5,6 +5,7 @@ from .archetypes import run_archetype_analysis, player_archetype_profile
 from .elo_forecast import (
     build_game_features,
     train_elo_model,
+    train_win_classifier,
     predict_elo_trajectory,
     load_model,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "player_archetype_profile",
     "build_game_features",
     "train_elo_model",
+    "train_win_classifier",
     "predict_elo_trajectory",
     "load_model",
 ]

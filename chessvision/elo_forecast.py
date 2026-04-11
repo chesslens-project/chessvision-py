@@ -532,3 +532,249 @@ def load_model(model_dir: Path) -> Tuple[ELOForecaster, StandardScaler, dict]:
         history = json.load(f)
 
     return model, scaler, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option B — Win probability classifier
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WinProbabilityClassifier(nn.Module):
+    """
+    LSTM classifier predicting win probability for the next game.
+    Works well with smaller personal datasets (1,000+ games).
+
+    Input  : (batch, seq_len, n_features)
+    Output : (batch, 1) — probability of winning next game [0, 1]
+    """
+    def __init__(
+        self,
+        input_size:  int,
+        hidden_size: int = 64,
+        dropout:     float = 0.3,
+    ):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size  = input_size,
+            hidden_size = hidden_size,
+            num_layers  = 1,
+            batch_first = True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc1     = nn.Linear(hidden_size, 32)
+        self.relu    = nn.ReLU()
+        self.fc2     = nn.Linear(32, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out     = out[:, -1, :]
+        out     = self.dropout(out)
+        out     = self.relu(self.fc1(out))
+        return self.sigmoid(self.fc2(out)).squeeze(-1)
+
+
+class WinDataset(Dataset):
+    """
+    Sliding window dataset for win probability training.
+    Target: 1 if player won next game, 0 otherwise.
+    """
+    def __init__(
+        self,
+        game_df: pd.DataFrame,
+        seq_len: int = 15,
+        feature_cols: list = GAME_FEATURES,
+    ):
+        self.X = []
+        self.y = []
+
+        # Encode result as win for the player
+        def encode_result(row):
+            if row["result"] == "1-0" and row["color"] == "white":
+                return 1.0
+            elif row["result"] == "0-1" and row["color"] == "black":
+                return 1.0
+            elif row["result"] in ["1/2-1/2", "*"]:
+                return 0.5
+            return 0.0
+
+        data = game_df.copy()
+        data["win"] = data.apply(encode_result, axis=1)
+
+        feat_cols = [c for c in feature_cols if c in data.columns]
+        data = data.dropna(subset=feat_cols).reset_index(drop=True)
+
+        for i in range(len(data) - seq_len):
+            seq    = data.iloc[i:i+seq_len][feat_cols].values.astype(np.float32)
+            target = data.iloc[i+seq_len]["win"]
+            self.X.append(seq)
+            self.y.append(float(target))
+
+        self.X = np.array(self.X)
+        self.y = np.array(self.y, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.X[idx]), torch.tensor(self.y[idx])
+
+
+def train_win_classifier(
+    game_df: pd.DataFrame,
+    seq_len:     int   = 15,
+    hidden_size: int   = 64,
+    epochs:      int   = 50,
+    batch_size:  int   = 32,
+    lr:          float = 0.001,
+    patience:    int   = 10,
+    output_dir:  Optional[Path] = None,
+) -> Tuple[WinProbabilityClassifier, StandardScaler, dict]:
+    """
+    Train the win probability classifier on personal game history.
+
+    Much more data-efficient than ELO forecasting.
+    Works well with 1,000+ games.
+    """
+    print("=" * 60)
+    print("Win Probability Classifier (LSTM)")
+    print("=" * 60)
+
+    scaler    = StandardScaler()
+    data      = game_df.copy()
+    feat_cols = [c for c in GAME_FEATURES if c in data.columns]
+    data[feat_cols] = scaler.fit_transform(data[feat_cols])
+    data      = data.fillna(0)
+
+    n        = len(data)
+    train_df = data.iloc[:int(n * 0.7)]
+    val_df   = data.iloc[int(n * 0.7):int(n * 0.85)]
+    test_df  = data.iloc[int(n * 0.85):]
+
+    print(f"\nDataset split:")
+    print(f"  Train : {len(train_df)} games")
+    print(f"  Val   : {len(val_df)} games")
+    print(f"  Test  : {len(test_df)} games")
+
+    train_ds = WinDataset(train_df, seq_len, feat_cols)
+    val_ds   = WinDataset(val_df,   seq_len, feat_cols)
+    test_ds  = WinDataset(test_df,  seq_len, feat_cols)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
+
+    device = torch.device("mps" if torch.backends.mps.is_available()
+                          else "cpu")
+    print(f"  Device : {device}\n")
+
+    model = WinProbabilityClassifier(
+        input_size  = len(feat_cols),
+        hidden_size = hidden_size,
+    ).to(device)
+
+    optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion  = nn.BCELoss()
+    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=5, factor=0.5
+    )
+
+    history        = {"train_loss": [], "val_loss": []}
+    best_val_loss  = float("inf")
+    best_weights   = None
+    patience_count = 0
+
+    print(f"Training for up to {epochs} epochs...")
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            pred = model(X_batch)
+            loss = criterion(pred, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                pred = model(X_batch.to(device))
+                loss = criterion(pred, y_batch.to(device))
+                val_losses.append(loss.item())
+
+        train_loss = np.mean(train_losses)
+        val_loss   = np.mean(val_losses)
+        history["train_loss"].append(float(train_loss))
+        history["val_loss"].append(float(val_loss))
+        scheduler.step(val_loss)
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | "
+                  f"train: {train_loss:.4f} | "
+                  f"val: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss  = val_loss
+            best_weights   = {k: v.clone()
+                              for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= patience:
+                print(f"\n  Early stopping at epoch {epoch+1}")
+                break
+
+    model.load_state_dict(best_weights)
+
+    # Test evaluation
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            pred = model(X_batch.to(device)).cpu().numpy()
+            all_preds.extend(pred)
+            all_targets.extend(y_batch.numpy())
+
+    all_preds   = np.array(all_preds)
+    all_targets = np.array(all_targets)
+
+    # Binary accuracy (threshold at 0.5)
+    binary_preds   = (all_preds > 0.5).astype(float)
+    binary_targets = (all_targets > 0.5).astype(float)
+    accuracy       = np.mean(binary_preds == binary_targets) * 100
+
+    # Brier score (lower is better, 0.25 = random)
+    brier = np.mean((all_preds - all_targets)**2)
+
+    print(f"\nTest results:")
+    print(f"  Accuracy    : {accuracy:.1f}%")
+    print(f"  Brier score : {brier:.4f} (random=0.25, perfect=0.0)")
+    print(f"  Best val loss: {best_val_loss:.4f}")
+
+    history["accuracy"]   = float(accuracy)
+    history["brier"]      = float(brier)
+
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(),
+                   output_dir / "win_classifier.pt")
+        joblib.dump(scaler,
+                    output_dir / "win_scaler.joblib")
+        with open(output_dir / "win_history.json", "w") as f:
+            json.dump(history, f, indent=2)
+        with open(output_dir / "win_config.json", "w") as f:
+            json.dump({
+                "input_size":  len(feat_cols),
+                "hidden_size": hidden_size,
+                "seq_len":     seq_len,
+                "features":    feat_cols,
+            }, f, indent=2)
+        print(f"  Saved to {output_dir}")
+
+    return model, scaler, history
