@@ -6,8 +6,7 @@ A Python library for computational chess performance analysis. Takes your PGN ga
 
 - Parses PGN files from chess.com, lichess, or OTB tournaments
 - Evaluates every position with Stockfish (cached, resumable)
-- Engineers behavioral features: clock pressure, position complexity, novelty index, mobility ratio
-- Clusters your errors into 5 distinct archetypes using HDBSCAN
+- Clusters your errors into 5 distinct archetypes
 - Embeds your playing style into a vector space trained on 29.3M elite games
 - Forecasts ELO trajectory using a model trained on 67,115 elite players
 - Generates a personalized weekly training plan
@@ -48,26 +47,9 @@ report = cv.analyze_player(moves, games, errors, "YourUsername")
 
 Models are hosted on Hugging Face at `rakkshet/chessvision-models` and download automatically on first use:
 
-- `chess2vec` — style embedding trained on 29.3M elite games (180MB)
-- `population_lstm` — ELO trajectory model trained on 67,115 players (5MB)
-- `error_archetypes` — HDBSCAN clustering model (50MB)
-
-## Validation results
-
-- chess2vec recovers known stylistic groupings without labeled data
-  - Tal vs Nezhmetdinov similarity: 0.979
-  - Cross-cluster separation: 0.115 cosine units
-- Population LSTM: 53.2% direction accuracy on held-out players (above 50% baseline)
-- 5 error archetypes discovered from 96,651 error moves across 4,685 games
-
-## Research
-
-This package is being developed alongside four papers currently in preparation:
-
-1. chessvision: Open-source computational chess analysis (targeting JOSS)
-2. Beyond blunders: A ML taxonomy of chess decision errors (targeting JQAS)
-3. Chess style in continuous space: Unsupervised player embeddings (targeting CHB)
-4. Causal identification of skill acquisition from behavioral panel data (targeting JEBO)
+```python
+cv.download_models()
+```
 
 ## License
 
