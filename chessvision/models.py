@@ -16,7 +16,7 @@ CACHE_DIR     = Path.home() / ".chessvision" / "models"
 MODEL_VERSION = "v0.1.0"
 
 # Models hosted on Hugging Face
-HF_REPO = "chesslens-project/chessvision-models"
+HF_REPO = "rakkshet/chessvision-models"
 MODELS  = {
     "chess2vec": {
     "files":       ["chess2vec.wordvectors",
