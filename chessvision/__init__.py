@@ -11,6 +11,11 @@ from .elo_forecast import (
     predict_elo_trajectory,
     load_model,
 )
+from .recommender import (
+    build_player_profile,
+    generate_recommendations,
+    analyze_player,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -27,4 +32,7 @@ __all__ = [
     "fine_tune_on_personal",
     "predict_elo_trajectory",
     "load_model",
+    "build_player_profile",
+    "generate_recommendations",
+    "analyze_player",
 ]
