@@ -23,8 +23,9 @@ try:
     import torch
     import torch.nn as nn
     from torch.utils.data import Dataset, DataLoader
+    TORCH_AVAILABLE = True
 except ImportError:
-    raise ImportError("Install PyTorch: pip3 install torch")
+    TORCH_AVAILABLE = False
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
