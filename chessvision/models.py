@@ -19,11 +19,10 @@ MODEL_VERSION = "v0.1.0"
 HF_REPO = "chesslens-project/chessvision-models"
 MODELS  = {
     "chess2vec": {
-        "files":       ["chess2vec.wordvectors",
-                        "chess2vec.wordvectors.vectors.npy",
-                        "chess2vec.meta.json"],
-        "description": "Style embedding model trained on 29.3M elite games",
-        "size_mb":     180,
+    "files":       ["chess2vec.wordvectors",
+                    "chess2vec.meta.json"],
+    "description": "Style embedding model trained on 29.3M elite games",
+    "size_mb":     180,
     },
     "population_lstm": {
         "files":       ["population_lstm.pt",
