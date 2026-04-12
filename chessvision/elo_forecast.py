@@ -797,44 +797,22 @@ POPULATION_FEATURES = [
 
 
 def build_population_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Engineer features for population LSTM from basic game data.
-    Works without Stockfish — uses only result, ELO, opening, color.
-    """
     data = df.copy()
-
-    # Encode color
     data["color_encoded"] = (data["color"] == "white").astype(float)
-
-    # Rolling score over last 5 games (per player)
     data["rolling_score_5"] = (
         data.groupby("player")["score"]
         .transform(lambda x: x.rolling(5, min_periods=1).mean())
     )
-
-    # Rolling opponent ELO over last 5 games
     data["rolling_elo_5"] = (
         data.groupby("player")["player_elo"]
         .transform(lambda x: x.rolling(5, min_periods=1).mean())
     )
-
-    # ELO trend over last 10 games (slope)
-    def elo_trend(series):
-        result = series.copy() * 0
-        for i in range(len(series)):
-            window = series.iloc[max(0, i-10):i+1]
-            if len(window) >= 3:
-                x = np.arange(len(window))
-                slope = np.polyfit(x, window.values, 1)[0]
-                result.iloc[i] = slope
-        return result
-
     data["elo_trend_10"] = (
         data.groupby("player")["player_elo"]
-        .transform(elo_trend)
-    )
-
+        .transform(lambda x: x.diff(10).fillna(0))
+    ).astype(float)
     return data.fillna(0)
+
 
 
 class PopulationDataset(Dataset):
