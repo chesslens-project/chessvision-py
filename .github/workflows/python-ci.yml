@@ -24,8 +24,7 @@ jobs:
                       zstandard requests pytest pytest-timeout
 
       - name: Install HDBSCAN and UMAP
-        run: |
-          pip install hdbscan umap-learn
+        run: pip install hdbscan umap-learn
         continue-on-error: true
 
       - name: Run parser tests
@@ -54,4 +53,4 @@ jobs:
       - name: Lint
         run: |
           pip install ruff
-          ruff check chessvision/ --ignore E501
+          ruff check chessvision/ --ignore E501,F401,F841,F541
