@@ -26,6 +26,26 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    class Dataset:
+        pass
+    class nn:
+        class Module:
+            pass
+        class LSTM:
+            pass
+        class Linear:
+            pass
+        class Dropout:
+            pass
+        class ReLU:
+            pass
+        class Sigmoid:
+            pass
+        class MSELoss:
+            pass
+        class BCELoss:
+            pass
+
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
