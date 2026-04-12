@@ -1,4 +1,4 @@
-.DS_Store
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,22 +7,39 @@ dist/
 build/
 *.egg-info/
 .env
+
+# Mac
+.DS_Store
+
+# Data files — never commit these
 *.parquet
 data_*.csv
-data/tokens/
-data/chess2vec_model/
-*.model
-*.wordvectors
-# Model outputs
-archetypes/
-chess2vec_model/
-model_test/
-tokens/
-tokens_test/
+*.parquet
 nohup.out
+
+# Log files
 eval_log.txt
 stream_log.txt
+train_log.txt
+population_log.txt
+population_lstm_log.txt
+combined_log.txt
+elo_log.txt
+elo_log2.txt
+win_log.txt
 archetypes_log.txt
-data_moves_evaluated.parquet
-data_moves_featured.parquet
-data_games.parquet
+
+# Model outputs — too large for git
+tokens/
+tokens_test/
+chess2vec_model/
+population_model/
+elo_model/
+win_model/
+combined_model/
+model_test/
+archetypes/
+
+# Reports
+my_report.json
+chess2vec_validation.json

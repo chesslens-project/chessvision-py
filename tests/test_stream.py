@@ -2,13 +2,12 @@ import pytest
 import gzip
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 import chess
 import chess.pgn
 import io
 
 from scripts.lichess_stream import (
-    find_pgn_zst_files,
+    find_pgn_files,
     extract_year_month,
     tokenize_game,
     _accept_game,
@@ -44,40 +43,36 @@ def sample_game():
 
 
 @pytest.fixture
-def sample_zst_file(tmp_path):
-    """Create a minimal .pgn.zst file for testing."""
-    import zstandard as zstd
-    pgn_path = tmp_path / "lichess_db_standard_rated_2026-03.pgn.zst"
-    cctx     = zstd.ZstdCompressor()
-    with open(pgn_path, "wb") as f:
-        f.write(cctx.compress(SAMPLE_PGN.encode("utf-8")))
+def sample_pgn_file(tmp_path):
+    pgn_path = tmp_path / "lichess_elite_2026-03.pgn"
+    pgn_path.write_text(SAMPLE_PGN)
     return pgn_path
 
 
-def test_find_single_file(sample_zst_file):
-    files = find_pgn_zst_files(sample_zst_file)
+def test_find_single_file(sample_pgn_file):
+    files = find_pgn_files(sample_pgn_file)
     assert len(files) == 1
-    assert files[0] == sample_zst_file
+    assert files[0] == sample_pgn_file
 
 
-def test_find_files_in_directory(sample_zst_file):
-    files = find_pgn_zst_files(sample_zst_file.parent)
+def test_find_files_in_directory(sample_pgn_file):
+    files = find_pgn_files(sample_pgn_file.parent)
     assert len(files) >= 1
 
 
 def test_find_files_empty_dir(tmp_path):
     with pytest.raises(FileNotFoundError):
-        find_pgn_zst_files(tmp_path)
+        find_pgn_files(tmp_path)
 
 
-def test_extract_year_month(sample_zst_file):
-    year, month = extract_year_month(sample_zst_file)
+def test_extract_year_month(sample_pgn_file):
+    year, month = extract_year_month(sample_pgn_file)
     assert year  == 2026
     assert month == 3
 
 
 def test_extract_year_month_unknown():
-    p = Path("unknown_file.pgn.zst")
+    p = Path("unknown_file.pgn")
     year, month = extract_year_month(p)
     assert year  == 0
     assert month == 0
@@ -158,24 +153,24 @@ def test_parse_clock_missing():
     assert _parse_clock_bucket("") == "noclock"
 
 
-def test_process_file_creates_output(sample_zst_file, tmp_path):
+def test_process_file_creates_output(sample_pgn_file, tmp_path):
     output_dir = tmp_path / "tokens"
-    stats      = process_file(sample_zst_file, output_dir)
+    stats      = process_file(sample_pgn_file, output_dir)
     assert stats["games_written"] >= 0
     token_files = list(output_dir.glob("*.txt.gz"))
     assert len(token_files) == 1
 
 
-def test_process_file_skips_if_exists(sample_zst_file, tmp_path):
+def test_process_file_skips_if_exists(sample_pgn_file, tmp_path):
     output_dir = tmp_path / "tokens"
-    stats1     = process_file(sample_zst_file, output_dir)
-    stats2     = process_file(sample_zst_file, output_dir)
+    stats1     = process_file(sample_pgn_file, output_dir)
+    stats2     = process_file(sample_pgn_file, output_dir)
     assert stats1["games_written"] == stats2["games_written"]
 
 
-def test_process_file_meta_json(sample_zst_file, tmp_path):
+def test_process_file_meta_json(sample_pgn_file, tmp_path):
     output_dir = tmp_path / "tokens"
-    process_file(sample_zst_file, output_dir)
+    process_file(sample_pgn_file, output_dir)
     meta_files = list(output_dir.glob("*.meta.json"))
     assert len(meta_files) == 1
     with open(meta_files[0]) as f:
