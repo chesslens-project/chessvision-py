@@ -778,3 +778,468 @@ def train_win_classifier(
         print(f"  Saved to {output_dir}")
 
     return model, scaler, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Option A — Population LSTM
+# ─────────────────────────────────────────────────────────────────────────────
+
+POPULATION_FEATURES = [
+    "score",
+    "elo_delta",
+    "move_count",
+    "eco_family",
+    "color_encoded",
+    "rolling_score_5",
+    "rolling_elo_5",
+    "elo_trend_10",
+]
+
+
+def build_population_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineer features for population LSTM from basic game data.
+    Works without Stockfish — uses only result, ELO, opening, color.
+    """
+    data = df.copy()
+
+    # Encode color
+    data["color_encoded"] = (data["color"] == "white").astype(float)
+
+    # Rolling score over last 5 games (per player)
+    data["rolling_score_5"] = (
+        data.groupby("player")["score"]
+        .transform(lambda x: x.rolling(5, min_periods=1).mean())
+    )
+
+    # Rolling opponent ELO over last 5 games
+    data["rolling_elo_5"] = (
+        data.groupby("player")["player_elo"]
+        .transform(lambda x: x.rolling(5, min_periods=1).mean())
+    )
+
+    # ELO trend over last 10 games (slope)
+    def elo_trend(series):
+        result = series.copy() * 0
+        for i in range(len(series)):
+            window = series.iloc[max(0, i-10):i+1]
+            if len(window) >= 3:
+                x = np.arange(len(window))
+                slope = np.polyfit(x, window.values, 1)[0]
+                result.iloc[i] = slope
+        return result
+
+    data["elo_trend_10"] = (
+        data.groupby("player")["player_elo"]
+        .transform(elo_trend)
+    )
+
+    return data.fillna(0)
+
+
+class PopulationDataset(Dataset):
+    """
+    Multi-player sliding window dataset.
+    Each sample: SEQ_LEN games from one player → ELO change in next 10 games.
+    """
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        seq_len: int = 20,
+        feature_cols: list = POPULATION_FEATURES,
+        target_col: str = "elo_change_next10",
+    ):
+        self.X = []
+        self.y = []
+
+        feat_cols = [c for c in feature_cols if c in df.columns]
+
+        for player, group in df.groupby("player"):
+            group = group.sort_values("game_num").reset_index(drop=True)
+            group = group.dropna(subset=[target_col])
+
+            for i in range(len(group) - seq_len):
+                seq    = group.iloc[i:i+seq_len][feat_cols].values.astype(
+                    np.float32)
+                target = group.iloc[i+seq_len][target_col]
+                if not np.isnan(target):
+                    self.X.append(seq)
+                    self.y.append(float(target))
+
+        self.X = np.array(self.X)
+        self.y = np.array(self.y, dtype=np.float32)
+        print(f"  Population dataset: {len(self.X):,} samples")
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.X[idx]), torch.tensor(self.y[idx])
+
+
+def train_population_lstm(
+    population_parquet: Path,
+    seq_len:     int   = 20,
+    hidden_size: int   = 128,
+    epochs:      int   = 30,
+    batch_size:  int   = 256,
+    lr:          float = 0.001,
+    patience:    int   = 5,
+    output_dir:  Optional[Path] = None,
+) -> Tuple[ELOForecaster, StandardScaler, dict]:
+    """
+    Train LSTM on population data from thousands of players.
+    This is the Option A model — trained on Elite Database players.
+
+    Parameters
+    ----------
+    population_parquet : path to parquet file from build_population_data.py
+    """
+    print("=" * 60)
+    print("Phase 3D Option A — Population LSTM")
+    print("=" * 60)
+
+    df = pd.read_parquet(population_parquet)
+    print(f"\nLoaded {len(df):,} game records")
+    print(f"Players: {df['player'].nunique():,}")
+
+    df = build_population_features(df)
+
+    feat_cols = [c for c in POPULATION_FEATURES if c in df.columns]
+    print(f"Features: {feat_cols}")
+
+    # Scale features globally
+    scaler = StandardScaler()
+    df[feat_cols] = scaler.fit_transform(df[feat_cols])
+    df = df.fillna(0)
+
+    # Split players into train/val/test (not games — avoid data leakage)
+    players    = df["player"].unique()
+    np.random.seed(42)
+    np.random.shuffle(players)
+
+    n          = len(players)
+    train_p    = players[:int(n * 0.7)]
+    val_p      = players[int(n * 0.7):int(n * 0.85)]
+    test_p     = players[int(n * 0.85):]
+
+    train_df   = df[df["player"].isin(train_p)]
+    val_df     = df[df["player"].isin(val_p)]
+    test_df    = df[df["player"].isin(test_p)]
+
+    print(f"\nPlayer split:")
+    print(f"  Train : {len(train_p):,} players, {len(train_df):,} games")
+    print(f"  Val   : {len(val_p):,} players, {len(val_df):,} games")
+    print(f"  Test  : {len(test_p):,} players, {len(test_df):,} games")
+
+    print("\nBuilding datasets...")
+    train_ds = PopulationDataset(train_df, seq_len, feat_cols)
+    val_ds   = PopulationDataset(val_df,   seq_len, feat_cols)
+    test_ds  = PopulationDataset(test_df,  seq_len, feat_cols)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
+
+    device = torch.device("mps" if torch.backends.mps.is_available()
+                          else "cpu")
+    print(f"Device: {device}\n")
+
+    model = ELOForecaster(
+        input_size  = len(feat_cols),
+        hidden_size = hidden_size,
+    ).to(device)
+
+    optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=3, factor=0.5
+    )
+    criterion  = nn.MSELoss()
+
+    history        = {"train_loss": [], "val_loss": []}
+    best_val_loss  = float("inf")
+    best_weights   = None
+    patience_count = 0
+
+    print(f"Training for up to {epochs} epochs...")
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            pred = model(X_batch)
+            loss = criterion(pred, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                pred = model(X_batch.to(device))
+                loss = criterion(pred, y_batch.to(device))
+                val_losses.append(loss.item())
+
+        train_loss = np.mean(train_losses)
+        val_loss   = np.mean(val_losses)
+        history["train_loss"].append(float(train_loss))
+        history["val_loss"].append(float(val_loss))
+        scheduler.step(val_loss)
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | "
+                  f"train: {train_loss:.2f} | val: {val_loss:.2f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss  = val_loss
+            best_weights   = {k: v.clone()
+                              for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= patience:
+                print(f"\n  Early stopping at epoch {epoch+1}")
+                break
+
+    model.load_state_dict(best_weights)
+
+    # Test evaluation
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            pred = model(X_batch.to(device)).cpu().numpy()
+            all_preds.extend(pred)
+            all_targets.extend(y_batch.numpy())
+
+    all_preds   = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    mae         = np.mean(np.abs(all_preds - all_targets))
+    rmse        = np.sqrt(np.mean((all_preds - all_targets)**2))
+    direction   = np.mean(
+        np.sign(all_preds) == np.sign(all_targets)
+    ) * 100
+
+    print(f"\nPopulation LSTM test results:")
+    print(f"  MAE            : {mae:.1f} ELO points")
+    print(f"  RMSE           : {rmse:.1f} ELO points")
+    print(f"  Direction acc. : {direction:.1f}%")
+
+    history["mae"]       = float(mae)
+    history["rmse"]      = float(rmse)
+    history["direction"] = float(direction)
+
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(),
+                   output_dir / "population_lstm.pt")
+        joblib.dump(scaler,
+                    output_dir / "population_scaler.joblib")
+        with open(output_dir / "population_history.json", "w") as f:
+            json.dump(history, f, indent=2)
+        with open(output_dir / "population_config.json", "w") as f:
+            json.dump({
+                "input_size":  len(feat_cols),
+                "hidden_size": hidden_size,
+                "seq_len":     seq_len,
+                "features":    feat_cols,
+            }, f, indent=2)
+        print(f"  Saved to {output_dir}")
+
+    return model, scaler, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combined model — transfer learning from population to personal
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fine_tune_on_personal(
+    population_model_dir: Path,
+    personal_game_df: pd.DataFrame,
+    seq_len:     int   = 15,
+    epochs:      int   = 20,
+    batch_size:  int   = 16,
+    lr:          float = 0.0001,
+    patience:    int   = 5,
+    output_dir:  Optional[Path] = None,
+) -> Tuple[WinProbabilityClassifier, StandardScaler, dict]:
+    """
+    Fine-tune the population model on personal game data.
+
+    This is the combined Option A + Option B model:
+    1. Load population LSTM weights (Option A)
+    2. Replace the output layer for win probability prediction
+    3. Fine-tune on personal game history (Option B)
+    4. Result: population knowledge + personal calibration
+
+    Parameters
+    ----------
+    population_model_dir : directory containing population_lstm.pt
+    personal_game_df     : output of build_game_features() for your games
+    """
+    print("=" * 60)
+    print("Combined Model — Transfer Learning (Option A → B)")
+    print("=" * 60)
+
+    # Load population config
+    with open(population_model_dir / "population_config.json") as f:
+        pop_config = json.load(f)
+
+    print(f"\nPopulation model: {pop_config['input_size']} features, "
+          f"hidden={pop_config['hidden_size']}")
+
+    # Build personal features using personal feature set
+    personal_scaler = StandardScaler()
+    data            = personal_game_df.copy()
+    feat_cols       = [c for c in GAME_FEATURES if c in data.columns]
+    data[feat_cols] = personal_scaler.fit_transform(data[feat_cols])
+    data            = data.fillna(0)
+
+    n        = len(data)
+    train_df = data.iloc[:int(n * 0.7)]
+    val_df   = data.iloc[int(n * 0.7):int(n * 0.85)]
+    test_df  = data.iloc[int(n * 0.85):]
+
+    train_ds = WinDataset(train_df, seq_len, feat_cols)
+    val_ds   = WinDataset(val_df,   seq_len, feat_cols)
+    test_ds  = WinDataset(test_df,  seq_len, feat_cols)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False)
+
+    device = torch.device("mps" if torch.backends.mps.is_available()
+                          else "cpu")
+
+    # Build classifier with same hidden size as population model
+    model = WinProbabilityClassifier(
+        input_size  = len(feat_cols),
+        hidden_size = pop_config["hidden_size"],
+    ).to(device)
+
+    # Transfer LSTM weights from population model
+    # (only if input sizes match — otherwise train from scratch)
+    if pop_config["input_size"] == len(feat_cols):
+        pop_state = torch.load(
+            population_model_dir / "population_lstm.pt",
+            map_location=device
+        )
+        # Transfer only LSTM weights, not output layers
+        model_state = model.state_dict()
+        transferred = {k: v for k, v in pop_state.items()
+                       if k.startswith("lstm")}
+        model_state.update(transferred)
+        model.load_state_dict(model_state)
+        print("  Transferred LSTM weights from population model")
+    else:
+        print(f"  Feature size mismatch "
+              f"(pop={pop_config['input_size']}, "
+              f"personal={len(feat_cols)}) — training from scratch")
+
+    # Fine-tune with lower learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCELoss()
+
+    history        = {"train_loss": [], "val_loss": []}
+    best_val_loss  = float("inf")
+    best_weights   = None
+    patience_count = 0
+
+    print(f"\nFine-tuning for up to {epochs} epochs "
+          f"(lr={lr}, patience={patience})...")
+    print(f"  Train: {len(train_ds)} samples | "
+          f"Val: {len(val_ds)} | Test: {len(test_ds)}")
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            pred = model(X_batch)
+            loss = criterion(pred, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                pred = model(X_batch.to(device))
+                loss = criterion(pred, y_batch.to(device))
+                val_losses.append(loss.item())
+
+        train_loss = np.mean(train_losses)
+        val_loss   = np.mean(val_losses)
+        history["train_loss"].append(float(train_loss))
+        history["val_loss"].append(float(val_loss))
+
+        if (epoch + 1) % 5 == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | "
+                  f"train: {train_loss:.4f} | val: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss  = val_loss
+            best_weights   = {k: v.clone()
+                              for k, v in model.state_dict().items()}
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= patience:
+                print(f"\n  Early stopping at epoch {epoch+1}")
+                break
+
+    model.load_state_dict(best_weights)
+
+    # Test
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            pred = model(X_batch.to(device)).cpu().numpy()
+            all_preds.extend(pred)
+            all_targets.extend(y_batch.numpy())
+
+    all_preds      = np.array(all_preds)
+    all_targets    = np.array(all_targets)
+    binary_preds   = (all_preds > 0.5).astype(float)
+    binary_targets = (all_targets > 0.5).astype(float)
+    accuracy       = np.mean(binary_preds == binary_targets) * 100
+    brier          = np.mean((all_preds - all_targets)**2)
+
+    print(f"\nCombined model test results:")
+    print(f"  Accuracy    : {accuracy:.1f}%")
+    print(f"  Brier score : {brier:.4f} (random=0.25)")
+    print(f"  Best val    : {best_val_loss:.4f}")
+
+    history["accuracy"] = float(accuracy)
+    history["brier"]    = float(brier)
+
+    if output_dir:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(),
+                   output_dir / "combined_model.pt")
+        joblib.dump(personal_scaler,
+                    output_dir / "combined_scaler.joblib")
+        with open(output_dir / "combined_history.json", "w") as f:
+            json.dump(history, f, indent=2)
+        with open(output_dir / "combined_config.json", "w") as f:
+            json.dump({
+                "input_size":  len(feat_cols),
+                "hidden_size": pop_config["hidden_size"],
+                "seq_len":     seq_len,
+                "features":    feat_cols,
+            }, f, indent=2)
+        print(f"  Saved to {output_dir}")
+
+    return model, personal_scaler, history

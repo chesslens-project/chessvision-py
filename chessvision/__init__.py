@@ -6,6 +6,8 @@ from .elo_forecast import (
     build_game_features,
     train_elo_model,
     train_win_classifier,
+    train_population_lstm,
+    fine_tune_on_personal,
     predict_elo_trajectory,
     load_model,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "build_game_features",
     "train_elo_model",
     "train_win_classifier",
+    "train_population_lstm",
+    "fine_tune_on_personal",
     "predict_elo_trajectory",
     "load_model",
 ]
