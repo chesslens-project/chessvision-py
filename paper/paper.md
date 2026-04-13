@@ -68,3 +68,19 @@ Pre-trained model weights are hosted on Hugging Face Hub [@wolf2020huggingfaces]
 The author thanks the Lichess.org team for maintaining the open Lichess Elite Database and the Stockfish development team for the open-source chess engine.
 
 # References
+
+# State of the field
+
+Chess performance analysis tools currently fall into two categories: commercial platforms such as chess.com and lichess.org that provide aggregate accuracy statistics, and standalone engines such as Stockfish [@stockfish] that evaluate individual positions. Neither category provides longitudinal behavioral analysis, error taxonomy, or personalized training recommendations grounded in population-level data. Academic work on computational chess has focused primarily on game-playing strength [@silver2017mastering] and opening preparation [@ganguly2014chess], with limited attention to amateur skill development. `chessvision-py` fills this gap by combining position evaluation, unsupervised clustering, and style embedding into a unified open-source framework targeting the amateur improvement use case.
+
+# Software design
+
+The package implements a five-stage pipeline as independent, composable modules. Each stage produces a tidy `pandas` DataFrame that serves as input to the next stage, allowing users to enter the pipeline at any point and substitute their own implementations. The evaluator module uses a SQLite cache to support resumable evaluation of large archives. The archetype module uses UMAP for dimensionality reduction followed by HDBSCAN for density-based clustering, avoiding the need to pre-specify the number of clusters. The chess2vec module trains a Word2Vec skip-gram model on structured move tokens, encoding phase, evaluation, and clock context alongside the algebraic move notation. Pre-trained model weights are hosted on Hugging Face Hub and downloaded automatically on first use.
+
+# Research impact
+
+`chessvision-py` enables three research directions. First, it provides a reproducible pipeline for longitudinal chess performance analysis, allowing researchers to replicate and extend findings on skill acquisition. Second, the chess2vec embeddings provide a continuous representation of playing style that can serve as input to downstream behavioral models. Third, the population LSTM trained on 67,115 elite players provides a baseline for ELO trajectory forecasting research. The accompanying R package and Shiny dashboard extend access to researchers without Python expertise.
+
+# AI usage disclosure
+
+Large language models were used to assist with code generation and documentation drafting during development of this package. All generated code was reviewed, tested, and validated by the author. The scientific methodology, experimental design, and empirical findings are the sole work of the author.
